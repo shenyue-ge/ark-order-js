@@ -2554,7 +2554,26 @@ const SKILL_EFFECT_RULES = {
     "xuanYou": { "power": 60, "defUp": 1, "talentHits": 3 } },
   "10432": { "id": 10432, "name": "羁绊连环", "effType": 2002, "type": 3,
     // 「目标为青龙/朱雀/玄武时，立即释放其最后释放的技能（单体目标随机）；成功后自身跳过下次行动」
-    "bondChain": true }
+    "bondChain": true },
+  // —— 2026-11-13 P1.5 群体辅助批次（6 个）——
+  "10216": { "id": 10216, "name": "星之传承", "effType": 2011, "type": 3,
+    // 「使用者HP≥40%：2回合内己方伤害+30%；HP<40%：+60%」
+    "starLegacy": { "rounds": 2, "threshold": 40, "highPct": 30, "lowPct": 60 } },
+  "10283": { "id": 10283, "name": "自由的呼吸", "effType": 2011, "type": 3,
+    // 「损失自身15%最大生命；己方全体随机能力+1~2级；HOLOLIVE 额外+1」
+    "freeBreath": { "hpCostPct": 15, "minUp": 1, "maxUp": 2, "holoExtra": 1 } },
+  "10291": { "id": 10291, "name": "风之返恩", "effType": 2011, "type": 3,
+    // 「己方全体下一次攻击伤害+30%；若5回合内该誓灵对使用者用过辅助技，则为+60%」
+    "windGrace": { "basePct": 30, "boostedPct": 60, "window": 5 } },
+  "10310": { "id": 10310, "name": "宝幡", "effType": 2011, "type": 3,
+    // 「清除我方所有负面能力等级，且随机一项防御+1」
+    "treasureBanner": true },
+  "10358": { "id": 10358, "name": "守护灵", "effType": 2011, "type": 3,
+    // 「己方本回合受伤-35%，受到治疗+20%」
+    "guardianSpirit": { "dmgDownPct": 35, "healUpPct": 20, "rounds": 1 } },
+  "10365": { "id": 10365, "name": "生命绽放", "effType": 2011, "type": 3,
+    // 「己方全体+10%护盾；消耗场上所有生命之种，随机 n 项能力+1」
+    "lifeBloom": { "shieldPct": 10 } }
 }
 
 function getSkillRule(skillId) {

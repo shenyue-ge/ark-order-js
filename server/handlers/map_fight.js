@@ -884,9 +884,12 @@ function pushFightRound(conn, fightId, round, fightList, batchIdx, updates, roun
     // 增量下发，enter 包保持入场前状态——与上方助战的顺序纪律同源）；settleRoundStartTalents 保留
     // 同三连兜底（flag 幂等，替补等后进场单位仍走其入场那一包）。
     {
-      const startFx = FC.settleBattleStartTalents(
-        (S.fightState.allies || []).concat(S.fightState.enemies || []), S.fightState);
+      const startUnits = (S.fightState.allies || []).concat(S.fightState.enemies || []);
+      const startFx = FC.settleBattleStartTalents(startUnits, S.fightState);
       if (startFx.length) roundEffects.push(...startFx);
+      // 21680 十香：开局减防在 entry 包下发（玩家选第一个技能前就能看到）
+      const tenkaStart = FC.applyTenkaOpeningDebuff(startUnits, 1);
+      if (tenkaStart.length) roundEffects.push(...tenkaStart);
     }
     log(`[fight] 波${batch} 回合1 进场 copy=${copyId}：我方 ${allies.length} + 敌方 ${oppNum}（${enemies.map(e => `lv${e.level} hp${e.maxHp}`).join(',')}）`);
   }
@@ -2346,7 +2349,10 @@ m_fight_skill_select_tos(conn, obj) {
         }
       }
     }
-    if (!choice) continue;
+    if (!choice) {
+      if (actor.eternalReleased) log(`[fight] 10323 解脱状态且无可用辅助技：${actor.id} 跳过行动`);
+      continue;
+    }
     const cfg = FC.skillCfg(choice.skillId);
     if (!cfg) continue;
     // 10372 反核弹外壳：连续两回合使用 → 50% 失败（不结算、不产生行动）
@@ -2467,6 +2473,26 @@ m_fight_skill_select_tos(conn, obj) {
     });
     actIndex++;
 
+    // 10399 瑶草：把反伤作为瑶姬的一条独立行动下发（敌人技能动画仍聚焦原目标）
+    if (effects.reflectEvents && effects.reflectEvents.length) {
+      effects.reflectEvents.forEach(ev => {
+        const srcUnit = units.find(u => u && Number(u.id) === Number(ev.from));
+        const dstUnit = units.find(u => u && Number(u.id) === Number(ev.to));
+        if (!srcUnit || !dstUnit) return;
+        fightList.push({
+          atk_id: bidOfUnit(srcUnit), skill_id: ev.skillId, index: actIndex, power_point: 0,
+          effect_list: [{
+            type: 0, target: bidOfUnit(dstUnit), hurt: ev.amount, final_hp: dstUnit.hp,
+            shield_hurt: 0, final_shield: Math.max(0, dstUnit.shield || 0),
+            element_shield_hurt: 0, final_element_shield: 0, extra: 0,
+          }],
+          result: 0,
+        });
+        actIndex++;
+        log(`[fight] 10399 瑶草反伤：${srcUnit.id} → ${dstUnit.id} ${ev.amount}`);
+      });
+    }
+
     // 10432 羁绊连环：目标为青龙/朱雀/玄武 → 以其身份插入一条独立行动（有技能动画/伤害数字）
     if (cfg.id === 10432) {
       const bc = FC.bondChainCast(actor, targets, units, actIndex, st);
@@ -2570,6 +2596,9 @@ m_fight_skill_select_tos(conn, obj) {
   // 回合末异常状态伤害与持续时间自然衰减
   const endTicks = FC.settleRoundEndTicks(units, st);
   if (endTicks.length) roundEffects.push(...endTicks);
+  // 21680 十香：回合末为下一回合随机敌人挂减防（在下一轮选技前可见）
+  const tenkaNext = FC.applyTenkaOpeningDebuff(units, 7);
+  if (tenkaNext.length) roundEffects.push(...tenkaNext);
   // MVP 统计回合收口：HP 差分兜底绕过 results 的突变（毒/燃烧/诅咒/反伤/自回/复活），守恒式：
   // 我方单位 期初HP−期末HP = Σ承伤 − Σ治疗(受疗口径)（调研-结算详情页.md §4.2）
   FS.settleRoundDiff(st.mvpStats, units, mvpHpBegin, mvpRoundLog);

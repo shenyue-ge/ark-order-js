@@ -36,12 +36,15 @@ function st() {
   const s = S.feelingState;
   if (!s.battleGain) s.battleGain = {};
   if (!Array.isArray(s.dormChecked)) s.dormChecked = [];
+  // 触摸（大厅立绘）每日计数：{count 已计入次数, sat 已贡献 satisfaction, lastTs 上次计入时间}
+  if (!s.touch || typeof s.touch !== 'object') s.touch = { count: 0, sat: 0, lastTs: 0 };
   const today = dayKey();
   if (s.day !== today) {
     s.day = today;
     s.giftUsed = 0;        // 送礼次数按天重置
     s.battleGain = {};     // 战斗涨羁绊的每日上限计数按天重置
-    log(`[feeling] 每日重置：送礼次数 + 战斗涨羁绊上限（${today}）`);
+    s.touch = { count: 0, sat: 0, lastTs: 0 }; // 触摸次数/当日满足度按天重置（冷却不跨天沿用）
+    log(`[feeling] 每日重置：送礼次数 + 战斗涨羁绊上限 + 触摸次数（${today}）`);
   }
   return s;
 }
@@ -127,6 +130,65 @@ function addBattleFeeling(conn, servantIds, rng) {
 // 要开就往 m_copy_barrier_info_toc.act_end_time 塞 {id:201, val:结束时间戳}，客户端自然显示 1.5 倍
 function actFeelMul() {
   return 1;
+}
+
+// ---- 立绘触摸涨羁绊（大厅主页面触摸好感）----
+// 触摸没有专用协议：复用图鉴语音上报 m_role_handbook_play_cv_tos（handbook.js 转进来）。
+// 场景判据 = 客户端补丁标记 play_type=3（见 data/feeling_rules.js TOUCH_* 段与
+// client/Modules/main/MainModuleAutoGen.lua 的运行时补丁）——只认大厅主页面立绘点击，其余调用方发 2 不计数。
+// 可触摸对象 = 大厅当前展示组（L.helperOrderIds()：助手组轮转位，未勾选助手时兜底单只）。
+// 返回 {counted, reason, servant, gain, count, sat}；不抛异常（上报型协议的副作用不能影响主流程）。
+function resolveTouchedServant(typeId) {
+  const t = Number(typeId) || 0;
+  if (t <= 0) return null;
+  const group = L.helperOrderIds()
+    .map(id => S.servants.find(b => Number(b.id) === Number(id)))
+    .filter(Boolean);
+  // 上报 type 必须 ∈ 大厅展示组：同名多只取名册第一只（同一时刻界面上只会有一只）
+  if (!group.some(b => Number(b.type) === t)) return null;
+  return S.servants.find(b => Number(b.type) === t) || null;
+}
+
+function touchFeeling(conn, obj) {
+  const typeId = Number((obj && obj.servant_type_id) || 0);
+  const cvId = Number((obj && obj.cv_id) || 0);
+  const playType = Number((obj && obj.play_type) || 0);
+  // 非触摸场景（图鉴点播/详情页/养成自动上报…）：不计数，也不写状态
+  if (playType !== R.TOUCH_PLAY_TYPE) return { counted: false, reason: 'not_touch_scene' };
+  if (cvId < R.TOUCH_CV_MIN || cvId > R.TOUCH_CV_MAX) return { counted: false, reason: 'not_touch_scene' };
+  const s = st();
+  const b = resolveTouchedServant(typeId);
+  if (!b) return { counted: false, reason: 'not_main_hall' };
+  const now = nowSec();
+  let reason = null;
+  let gain = 0;
+  // 闸门按顺序判定，命中即记录原因（被拒时不写状态/不耗次数/不加满足度）
+  if ((Number(s.touch.count) || 0) >= R.TOUCH_DAILY_LIMIT) reason = 'daily_limit';
+  else if ((Number(s.touch.lastTs) || 0) && now - Number(s.touch.lastTs) < R.TOUCH_COOLDOWN_SEC) reason = 'cooldown';
+  else {
+    const budget = R.TOUCH_DAILY_FEELING_CAP * FD.SATISFACTION_PER_POINT - (Number(s.touch.sat) || 0);
+    gain = Math.min(R.TOUCH_SATISFACTION, budget);
+    if (gain <= 0) reason = 'daily_sat_cap';
+    else if (R.isFeelingFull(b)) reason = 'feeling_max'; // 羁绊已满：不再涨、也不空耗额度
+  }
+  if (reason) {
+    log(`[feeling] 触摸未计入（${reason}）type=${typeId} cv=${cvId} `
+      + `今日 ${Number(s.touch.count) || 0}/${R.TOUCH_DAILY_LIMIT} 次`);
+    return { counted: false, reason, servant: b, gain: 0, count: Number(s.touch.count) || 0, sat: Number(s.touch.sat) || 0 };
+  }
+  const res = R.applyGain(b, gain, now);
+  s.touch.count = (Number(s.touch.count) || 0) + 1;
+  s.touch.sat = (Number(s.touch.sat) || 0) + gain;
+  s.touch.lastTs = now; // 只有"计入"的触摸才刷新冷却起点
+  saveState();
+  // 触摸会动满足度池 ⇒ key=7(feeling) 与 key=11(satisfaction) 两条都推（与送礼同一条刷新路径）
+  if (conn) pushFeelingChanges(conn, [b]);
+  log(`[feeling] 触摸 servant=${b.id} type=${b.type} cv=${cvId} satisfaction+${gain}`
+    + ` → 羁绊 ${res.before}→${res.feeling}/${R.maxFeelingOf(b)}（进度 ${res.satisfaction}/${FD.SATISFACTION_PER_POINT}`
+    + `${res.capped ? `，触顶丢弃 ${res.capped}` : ''}）`
+    + `${res.milestones.length ? ` 解锁里程碑 ${res.milestones.join('/')}` : ''}`
+    + ` 今日 ${s.touch.count}/${R.TOUCH_DAILY_LIMIT} 次（触摸满足度 ${s.touch.sat}/${R.TOUCH_DAILY_FEELING_CAP * FD.SATISFACTION_PER_POINT}）`);
+  return { counted: true, reason: null, servant: b, gain, count: s.touch.count, sat: s.touch.sat, points: res.points };
 }
 
 // ---- 休息位自动上涨（二百七十四）：满足度增速 + 誓灵收集（小惊喜）----
@@ -227,6 +289,7 @@ function onLogin(conn) {
 module.exports = {
   st, giftTimesMax, giftTimesLeft, wishList, wishOfServant, pushWishInfo,
   pushFeelingChanges, addBattleFeeling, actFeelMul, onLogin,
+  touchFeeling, resolveTouchedServant,
   restSettle, settleLeaveRest, dormRecords,
   CHANGE_ID_FEELING, CHANGE_ID_SATISFACTION, CHANGE_ID_PLEDGE_TIME,
   handlers: {

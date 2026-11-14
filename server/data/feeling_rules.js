@@ -31,6 +31,28 @@ const BATTLE_DAILY_CAP = 300;             // 每只每天战斗途径最多 +300
 const ACT_FEEL_MUL_ID = 201;              // CopyConst.DROP_ACT_FEEL_15
 const ACT_FEEL_MUL = 1.5;
 
+// ---- 立绘触摸涨羁绊（大厅主页面触摸好感）----
+// 客户端没有专用协议：触摸复用图鉴语音上报 m_role_handbook_play_cv_tos{servant_type_id, cv_id, play_type}。
+// 场景判据 = **客户端补丁标记** play_type=3：client/Modules/main/MainModuleAutoGen.lua 的运行时补丁只给
+//   MainFunctionPanel:onCardClick 里那次 playCv 追加一条直发（play_type=3）；图鉴/详情/养成/战斗等
+//   其余调用方仍是 2 ⇒ 服务端只认 3 即等价于「仅大厅主页面立绘触摸」。
+// cv_id 2..12 = 立绘对话索引域（cardSet.cvs/highCvs/times/touchs 全在此域；13+ 是战斗/养成/系统语音）。
+// 口径（沿用参考实现 Python 版的定稿口径，2026-09-24）：
+//   · 每次 +5 satisfaction，进**与送礼共用**的池子（客户端进度条可见，两边都照常累加）；
+//   · **不因进位而停**：进位照常发生，进位后继续摸照常给（上限是"当天累计"而不是"进位就关"）；
+//   · 每日全账号 20 次硬顶 + 30 秒全账号冷却（只对"计入"的触摸生效，冷却中不写状态/不耗次数）；
+//   · 每日触摸贡献的 satisfaction ≤ 100（= SATISFACTION_PER_POINT × 1，数字口径：最多 1 点羁绊）；
+//   · 羁绊已满（未婚 100 / 誓约后 200）⇒ 直接不计，不耗次数。
+// 数值客户端零配置（触摸涨多少/上限/冷却全在服务端），与送礼/战斗涨羁绊先例一样集中在本文件便于调参。
+const TOUCH_PLAY_TYPE = 3;         // 3 = 大厅主页面立绘触摸（客户端补丁标记）；2 = 其它立绘语音
+const TOUCH_LEGACY_PLAY_TYPE = 2;  // 旧客户端/其它调用方；服务端**不**据它计数
+const TOUCH_CV_MIN = 2;            // 立绘对话索引下界
+const TOUCH_CV_MAX = 12;           // 立绘对话索引上界（13+ = 战斗/养成/系统语音）
+const TOUCH_SATISFACTION = 5;      // 每次触摸 +5 satisfaction（进**共用**池）
+const TOUCH_DAILY_LIMIT = 20;      // 每日触摸次数上限（全账号共享）
+const TOUCH_DAILY_FEELING_CAP = 1; // 每日触摸产出的羁绊值上限（数字口径，全账号共享）
+const TOUCH_COOLDOWN_SEC = 30;     // 两次"计入"的触摸至少间隔 30 秒（全账号共享；0 = 关闭冷却）
+
 // ---- 灵契 ----
 const PLEDGE_NEED_FEELING = FD.FEELING_MAX; // 100（官方错误码 666003「与誓灵的羁绊值不足」）
 const RENAME_CD_DAYS = 30;                  // 客户端 ServantFeelView 本地也算 30 天改名 CD
@@ -207,6 +229,8 @@ function applyGain(b, gain, nowSec) {
 module.exports = {
   SATISFACTION_BY_COLOR, SATISFACTION_DEFAULT, WISH_MUL, GIFT_TIMES_PER_SLOT,
   BATTLE_CHANCE, BATTLE_GAIN, BATTLE_DAILY_CAP, ACT_FEEL_MUL_ID, ACT_FEEL_MUL,
+  TOUCH_PLAY_TYPE, TOUCH_LEGACY_PLAY_TYPE, TOUCH_CV_MIN, TOUCH_CV_MAX,
+  TOUCH_SATISFACTION, TOUCH_DAILY_LIMIT, TOUCH_DAILY_FEELING_CAP, TOUCH_COOLDOWN_SEC,
   PLEDGE_NEED_FEELING, RENAME_CD_DAYS, MESSAGE_MAX_LEN, ERR,
   isMarried, maxFeelingOf, feelingOf, isFeelingFull, moodOf,
   wishOf, hitsWish, giftGain, applyGain,

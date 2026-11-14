@@ -22,6 +22,7 @@ const { S, saveState } = require('../state');
 const L = require('../lib');
 const D = require('../data/handbook_data');
 const R = require('../data/feeling_rules');
+const F = require('./feeling');
 const log = require('../log').log;
 
 // ---- 确定性点赞基数（单机本地服无社交数据：以 typeId/skinId 散列出稳定值，玩家点赞 ±1 持久化） ----
@@ -288,16 +289,23 @@ module.exports = {
       });
     },
 
-    // ---- 解锁私密信息（点击"可解锁"条目）：一次解锁全部够羁绊门槛的条目 ----
-    // 播放语音上报（客户端 HandbookModule.toPlayCv）：只是"这条我听了"，**没有同名 toc**。
-    // 原实现走 start.js 的 fallbackHandler → 每点一次语音就在服务端打一条
-    // `?? 无处理器: m_role_handbook_play_cv_tos`（2026-09-12 日志实证），纯噪音。
-    // 这里显式吃掉：不写任何状态（first_cv_list 恒空，没有"新语音"标记可清），
-    // 只回 m_common_reply_toc 复位客户端的 1 秒网络等待。播放本身是客户端本地行为
-    // （AudioManager.playServantAudio），不依赖服务端。
-    m_role_handbook_play_cv_tos(conn) {
+    // ---- 播放语音上报（客户端 HandbookModule.toPlayCv）----
+    // 平时只是"这条我听了"，**没有同名 toc**；原实现走 start.js 的 fallbackHandler → 每点一次语音
+    // 就在服务端打一条 `?? 无处理器: m_role_handbook_play_cv_tos`（2026-09-12 日志实证），纯噪音。
+    // ★ 触摸涨羁绊复用这条上报：客户端补丁给大厅主页面立绘点击额外发 play_type=3
+    //   （client/Modules/main/MainModuleAutoGen.lua 的运行时补丁），其余调用方仍是 2。
+    //   结算在 feeling.touchFeeling（判定/数值/每日上限/冷却），这里只负责转交与回包。
+    // ⚠️ 无论是否计入都必须回 m_common_reply_toc：客户端发完 play_cv 收不到包会显示 loading
+    //   并触发重连循环（参考实现真机踩过两次）；本协议没有同名 toc，通用回复正是为它设计的。
+    m_role_handbook_play_cv_tos(conn, obj) {
+      try {
+        F.touchFeeling(conn, obj);
+      } catch (e) {
+        log(`[handbook] 触摸结算异常（不阻塞回包）：${e.message}`);
+      }
       conn.sendToc('m_common_reply_toc', { proto_id: 0 });
     },
+    // ---- 解锁私密信息（点击"可解锁"条目）：一次解锁全部够羁绊门槛的条目 ----
     // 客户端 HandbookVO.unlockAllCanUnlock 把所有 type=1 的改成 2，服务端要落账否则重开面板又变回可解锁
     m_handbook_unlock_tips_tos(conn, obj) {
       const hs = st();

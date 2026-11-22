@@ -543,27 +543,6 @@ function gmDispatch(conn, msg) {
     }
     return true;
   }
-  if (cmd === 'm21_furnitures' && parts.length >= 2) {
-    // m21_furnitures=<type_id>=<数量>：家具仓库直发（CfgDebug"获得家具"）；
-    // =0：全配方（CfgDorm.formula 152 件）每样 1 个，便于整目录摆放验证。家具不进背包，走 m_furnitures_update_toc
-    const dorm = require('./dorm');
-    const grantOne = (typeId, num) => {
-      if (!dorm.grantFurniture(conn, typeId, num)) { log(`[GM] 未知家具 type_id=${typeId}（CfgHouseFurniture 无配置，跳过）`); return 0; }
-      return num;
-    };
-    if (parseInt(parts[1]) === 0) {
-      const F = require('../data/dorm_furniture_data').FORMULA;
-      let n = 0;
-      for (const id of Object.keys(F)) n += grantOne(Number(id), 1);
-      log(`[GM] 全配方家具发放 ${n} 件`);
-    } else if (parts.length >= 3) {
-      const typeId = parseInt(parts[1]), num = parseInt(parts[2]) || 1;
-      if (grantOne(typeId, num)) log(`[GM] 家具 ${typeId} 入仓库 ×${num}`);
-    } else {
-      log('[GM] 用法：m21_furnitures=<type_id>=<数量> 或 m21_furnitures=0');
-    }
-    return true;
-  }
   if (cmd === 'm21_summon_pack' && parts.length >= 2) {
     // m21_summon_pack=<约定之契数量>[=<友情点>]：召唤自测包（约定之契 + 可选友情点；
     // 另有 m21_affinity_mats 供灵契召唤）。约定之契 31000004 是 CfgItems 白名单内道具。

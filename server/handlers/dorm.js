@@ -169,14 +169,99 @@ function costCrystal(cost) {
   S.roleAsset.gold_given -= useGiven;
   S.roleAsset.gold -= cost - useGiven;
 }
-// 发放家具入仓库（GM 指令用），推 m_furnitures_update_toc 增量刷新（ prosperity 客户端自动重算）
+// 可安全入仓库的家具白名单判定（与真机 CfgHouseFurniture + 出货/基座资源对账）：
+//   · 排除系统预摆建筑（kind 6派遣中心/7研究所/9体力产出/10金币产出/12补给贩卖机）与
+//     扩建施工占位牌（kind 11：100001~100004，maxNum=0、无 icon、点击直接触发扩建）；
+//     注意客户端 DormMgr.getFurnituresList 只过滤 THEME_KIND={6,7,9,10}，漏了 11/12，
+//     发进仓库会在编辑器家具栏露出无图条目甚至被重复摆出。
+//   · 排除官方无资源卫星件 200020（「音游家具」：PackOut/Alpha/KR 全缺 icon 与 spine）。
+//   · 保留 200021(hololive)/200022(Mea的柏青哥)/200024(小舟酱电子挂画)/30025(圣诞壁炉 maxNum=0)：
+//     美术资源完整，可作摆设；其余全部 295 种（墙纸/地板/路面/墙饰/室内/室外/互动/定制/魔偶）安全。
+const NON_GRANTABLE_FURNITURE_KINDS = new Set([6, 7, 9, 10, 11, 12]);
+const UNOBTAINABLE_FURNITURE_IDS = new Set([200020]);
+function isGrantableFurniture(typeId) {
+  const id = Number(typeId);
+  const meta = FUR.FURNITURE[id];
+  if (!meta) return false;
+  if (NON_GRANTABLE_FURNITURE_KINDS.has(Number(meta.kind))) return false;
+  if (UNOBTAINABLE_FURNITURE_IDS.has(id)) return false;
+  return true;
+}
+const ALL_GRANTABLE_FURNITURE_IDS = Object.keys(FUR.FURNITURE)
+  .map(Number)
+  .filter(id => isGrantableFurniture(id))
+  .sort((a, b) => a - b);
+
+// 若玩家当前正处于摆设编辑模式（S.dormState.editBackup 非空），GM 发进仓库的增量同步补入
+// 撤销基线——否则退出编辑点「取消」（m_dorm_save_tos op=0）会把刚发的家具整包回滚蒸发。
+function syncEditBackupWarehouseDelta(typeId, delta) {
+  const bak = S.dormState && S.dormState.editBackup;
+  if (!bak || !bak.warehouse || !(delta > 0)) return;
+  bak.warehouse[typeId] = (Number(bak.warehouse[typeId]) || 0) + delta;
+}
+
+// 批量发放家具入仓库（GM 一键全家具用）：整批只落盘 1 次 + 合并推 1 条 m_furnitures_update_toc
+// （避免逐件 grantFurniture 在 Android 外存触发百次 fsync 造成 [stall]/13s 超时）。
+//   entries: Array<[typeId, num]>
+//   opts.capByMaxNum: true 时按 CfgHouseFurniture.maxNum 钳制拥有上限（owned = 仓库 + 已摆放；
+//     maxNum=0 如 30025「圣诞壁炉」按官方语义视作无上限，直接 +num）。
+function grantFurnitureBatch(conn, entries, opts) {
+  const cap = !!(opts && opts.capByMaxNum);
+  if (!S.dormState) S.dormState = {};
+  if (!S.dormState.warehouse) S.dormState.warehouse = {};
+  if (!Array.isArray(S.dormState.furnitures)) S.dormState.furnitures = [];
+  const placedMap = new Map();
+  for (const f of S.dormState.furnitures) {
+    const tid = Number(f.type_id);
+    placedMap.set(tid, (placedMap.get(tid) || 0) + 1);
+  }
+  const touched = new Map();
+  let addedItems = 0, addedKinds = 0, cappedKinds = 0, skippedKinds = 0;
+  for (const pair of (entries || [])) {
+    const typeId = Number(pair && pair[0]);
+    const want = Math.floor(Number(pair && pair[1]));
+    if (!isGrantableFurniture(typeId) || !Number.isFinite(want) || want <= 0) {
+      skippedKinds++;
+      continue;
+    }
+    const meta = FUR.FURNITURE[typeId];
+    const curStock = Number(S.dormState.warehouse[typeId]) || 0;
+    const placed = placedMap.get(typeId) || 0;
+    let add = want;
+    if (cap && meta.maxNum > 0) {
+      const room = Math.max(0, meta.maxNum - (curStock + placed));
+      add = Math.min(want, room);
+      if (add <= 0) { cappedKinds++; continue; }
+    }
+    S.dormState.warehouse[typeId] = curStock + add;
+    syncEditBackupWarehouseDelta(typeId, add);
+    addedItems += add;
+    if (!touched.has(typeId)) addedKinds++;
+    touched.set(typeId, { id: typeId, val: S.dormState.warehouse[typeId], type: placed });
+  }
+  const content = [...touched.values()];
+  if (content.length) {
+    saveState();
+    if (conn && typeof conn.sendToc === 'function') {
+      conn.sendToc('m_furnitures_update_toc', { content });
+    }
+  }
+  return { addedItems, addedKinds, cappedKinds, skippedKinds, totalKinds: (entries || []).length, content };
+}
+
+// 发放单件家具入仓库（GM 单件指定发放 / 冒烟用），推 m_furnitures_update_toc 增量刷新
 function grantFurniture(conn, typeId, num) {
-  if (!FUR.FURNITURE[typeId]) return false;
-  S.dormState.warehouse[typeId] = (S.dormState.warehouse[typeId] || 0) + num;
+  const id = Number(typeId);
+  const n = Math.floor(Number(num));
+  if (!isGrantableFurniture(id) || !Number.isFinite(n) || n <= 0) return false;
+  S.dormState.warehouse[id] = (S.dormState.warehouse[id] || 0) + n;
+  syncEditBackupWarehouseDelta(id, n);
   saveState();
-  conn.sendToc('m_furnitures_update_toc', {
-    content: [{ id: typeId, val: S.dormState.warehouse[typeId], type: placedCountOf(typeId) }],
-  });
+  if (conn && typeof conn.sendToc === 'function') {
+    conn.sendToc('m_furnitures_update_toc', {
+      content: [{ id, val: S.dormState.warehouse[id], type: placedCountOf(id) }],
+    });
+  }
   return true;
 }
 
@@ -1826,7 +1911,10 @@ m_dorm_unlock_tos(conn, obj) {
   depotNotify: depotNotify, depotNonEmptyShelves: depotNonEmptyShelves,
   dormBuildingLv: dormBuildingLv, dormServantList: dormServantList,
   dormLv: dormLv, HOUSE_MAX_LV: HOUSE_MAX_LV, HOUSE_LEVEL_COST: HOUSE_LEVEL_COST, // 扩建：GM/冒烟共用同一份表
-  grantFurniture: grantFurniture, furnitureProsperity: furnitureProsperity,
+  grantFurniture: grantFurniture, grantFurnitureBatch: grantFurnitureBatch,
+  isGrantableFurniture: isGrantableFurniture, ALL_GRANTABLE_FURNITURE_IDS: ALL_GRANTABLE_FURNITURE_IDS,
+  UNOBTAINABLE_FURNITURE_IDS: UNOBTAINABLE_FURNITURE_IDS, NON_GRANTABLE_FURNITURE_KINDS: NON_GRANTABLE_FURNITURE_KINDS,
+  furnitureProsperity: furnitureProsperity,
   // 补给站 / 时光银行（二百一十六）：GM、冒烟、其它 handler 共用同一份表与结算入口
   SUPPLY_SHELVES: SUPPLY_SHELVES, SHELF_BY_ID: SHELF_BY_ID, SHELF_NORMAL: SHELF_NORMAL, SHELF_ADVANCE: SHELF_ADVANCE,
   shelfUnlocked: shelfUnlocked, shelfState: shelfState, shelfSettleAll: shelfSettleAll, shelfSettle: shelfSettle,

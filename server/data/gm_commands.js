@@ -621,6 +621,43 @@ module.exports = {
         + (clipped > 0 ? `，${clipped} 溢出未计` : ''));
     },
   },
+  'm21_furnitures': {
+    name: '获得家具', args: '=0 全家具各+1（受上限钳制，可多次点） / =<家具ID>[=<数量>]',
+    run(ctx, p) {
+      const dorm = require('../handlers/dorm');
+      const FUR = require('./dorm_furniture_data').FURNITURE;
+      const arg1 = p[1] !== undefined ? parseInt(p[1]) : 0;
+      if (p.length < 2 || arg1 === 0) {
+        // 面板按钮「指令 → 社交 → 获得家具」（CfgDebug gmCode="m21_furnitures=0"）走本分支：
+        // 全部 295 种安全可持有家具（已排除 4 件系统建筑 + 4 件施工牌 + 无资源 200020；
+        // 互动家具 200021/200022/200024 与圣诞壁炉 30025 保留作摆设），每次各 +1（或手打 =0=<N>），
+        // 受各自 maxNum 上限钳制，整批 1 次落盘 + 1 条合并 m_furnitures_update_toc。
+        const per = p.length >= 3 ? Math.max(1, Math.min(99, parseInt(p[2]) || 1)) : 1;
+        const entries = dorm.ALL_GRANTABLE_FURNITURE_IDS.map(id => [id, per]);
+        const r = dorm.grantFurnitureBatch(ctx.conn, entries, { capByMaxNum: true });
+        if (r.addedItems === 0) {
+          return ctx.ok(`全部 ${r.totalKinds} 种可持有家具均已达拥有上限（未再增加）`);
+        }
+        return ctx.ok(`新增 ${r.addedItems} 件（覆盖 ${r.addedKinds} 种`
+          + (r.cappedKinds ? `，${r.cappedKinds} 种已达上限` : '')
+          + `；安全全表 ${r.totalKinds} 种）`);
+      }
+      if (!Number.isFinite(arg1) || arg1 < 0) {
+        return ctx.fail('用法 m21_furnitures=0（全家具各+1）或 m21_furnitures=<家具ID>[=<数量>]');
+      }
+      const num = p.length >= 3 ? parseInt(p[2]) : 1;
+      if (!Number.isFinite(num) || num <= 0 || num > 999) {
+        return ctx.fail(`数量须为 1~999 的整数（收到 "${p[2]}"）`);
+      }
+      const meta = FUR[arg1];
+      if (!meta) return ctx.fail(`未知家具 ID ${arg1}（CfgHouseFurniture 无此配置）`);
+      if (!dorm.isGrantableFurniture(arg1)) {
+        return ctx.fail(`家具 ${arg1}（${meta.name}）不可发入仓库（系统建筑/施工占位/无资源件）`);
+      }
+      dorm.grantFurniture(ctx.conn, arg1, num);
+      return ctx.ok(`${arg1}（${meta.name}）+${num} → 仓库 ${ctx.S.dormState.warehouse[arg1]}`);
+    },
+  },
 
   // ---------------- 言灵录 / 双倍 / 签到 / 灵契 ----------------
   'm21_cv': {

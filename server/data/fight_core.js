@@ -234,11 +234,34 @@ function exclusiveExecute(results, units, threshold) {
   });
 }
 
-// 受疗方禁疗乘区（醉人的咖啡 10384）：治疗效果降低 75%
+// 受疗方禁疗/增疗乘区（10130 无间轮回 0 / 10384 醉人的咖啡 0.5 or 0.25 / 10358 守护灵 +20%）
 function healReceivedMul(t) {
   if (t && (t.healBlockRounds || 0) > 0) return 0;   // 10130 无间轮回：本回合完全禁疗
-  if (t && (t.healHalfRounds || 0) > 0) return 0.5;   // 10384 基础：治疗效果 -50%
-  return (t && (t.healBanRounds || 0) > 0) ? 0.25 : 1;
+  let m = 1;
+  if (t && (t.healHalfRounds || 0) > 0) m = 0.5;     // 10384 基础：治疗效果 -50%
+  else if (t && (t.healBanRounds || 0) > 0) m = 0.25;
+  if (t && (t.healUpRounds || 0) > 0 && Number(t.healUpPct) > 0) {
+    m *= 1 + Number(t.healUpPct) / 100;              // 10358 守护灵：受到治疗提升 20%
+  }
+  return m;
+}
+
+// 10151 恩赐转移：目标带有 healStealRounds>0 时，本次回复全额转交存活的夺取者；否则正常回复给目标
+function applyHealWithSteal(target, rawHeal, allUnits) {
+  if (!target || target.hp <= 0 || !(rawHeal > 0)) {
+    return { receiver: target, real: 0, overflow: 0, stolen: false };
+  }
+  const stealer = ((target.healStealRounds || 0) > 0 && target.healStealBy != null)
+    ? (allUnits || []).find(u => u && u.hp > 0 && Number(u.id) === Number(target.healStealBy))
+    : null;
+  const recv = stealer || target;
+  const maxH = recv.maxHp || (recv.attrs && recv.attrs.hp) || recv.hp;
+  const before = recv.hp;
+  const after = Math.min(maxH, recv.hp + rawHeal);
+  const real = Math.round(after) - Math.round(before);
+  const overflow = Math.max(0, rawHeal - real);
+  recv.hp = after;
+  return { receiver: recv, real, overflow, stolen: !!stealer };
 }
 
 // 攻方「回复量提升」乘区（联动圣器专属段，2026-10-25）：
@@ -1301,13 +1324,34 @@ function sanitizeEffectTargets(effect) {
   return Object.assign({}, effect, { tar_servant_ids: [] });
 }
 
-// 四个战斗出口的共用收尾：先按目标拆条（D9），再丢掉零变化属性事件。
+// 四个战斗出口的共用收尾：先按目标拆条（D9），丢掉零变化属性事件，
+// 并对同桶（phase/trigger_count/atk/src/id）+ 同目标 + 同符号的 HP 变更（200000）做防御性归并求和：
+// 客户端 FeatureLoop.dealFeatureEff（真机字节码 PC 300-484）复用已有 p_fight 后仍无条件 table.insert，
+// 同一目标在 effect_list 出现两次且致死时，initDieInfo 入列两份同单位 → 二次 dieRemove 命中已置空的
+// monsterData 崩溃，永久卡死战斗（弗雷 22131 2026-11-21 实证）。
 function flattenEffects(effects) {
   const out = [];
+  const hpBucketIdx = new Map();
   for (const e of effects || []) {
     if (isZeroAttrChange(e)) continue;
     for (const x of splitEffectByTarget(sanitizeEffectTargets(e))) {
-      if (!isZeroAttrChange(x)) out.push(x);
+      if (isZeroAttrChange(x)) continue;
+      if (Number(x.change_type) === 200000
+          && Array.isArray(x.tar_servant_ids) && x.tar_servant_ids.length === 1
+          && Array.isArray(x.change_value) && x.change_value.length === 1) {
+        const v = Number(x.change_value[0]) || 0;
+        if (v === 0) continue;
+        const sign = v < 0 ? -1 : 1;
+        const key = `${x.effect_phase}|${x.trigger_count || 0}|${x.atk_servant_id}|${x.src_servant_id}|${x.src_type}|${x.src_id}|${x.id}|${x.tar_servant_ids[0]}|${sign}`;
+        if (hpBucketIdx.has(key)) {
+          const idx = hpBucketIdx.get(key);
+          const prev = out[idx];
+          out[idx] = Object.assign({}, prev, { change_value: [(Number(prev.change_value[0]) || 0) + v] });
+          continue;
+        }
+        hpBucketIdx.set(key, out.length);
+      }
+      out.push(x);
     }
   }
   return out;
@@ -2239,9 +2283,10 @@ const EFF_FOE_ONE = new Set([1001, 1002, 1103, 1004, 1005, 1106, 1007, 1108, 100
 const EFF_FOE_COL = new Set([1051, 1052, 1153]);
 const EFF_FOE_ROW = new Set([1054, 1055, 1056, 1157]);
 const EFF_FOE_ALL = new Set([1058, 1059]);
-const EFF_FRIEND_ONE = new Set([2002, 2103, 2005, 2008, 2012, 2013, 2014, 2015, 2016]);
-const EFF_FRIEND_COL = new Set([2006, 2107]);
-const EFF_FRIEND_ROW = new Set([2009, 2110]);
+// 2005(自身直线己方)/2008(自身横排己方)按客户端 FightSkillMgr 属直线/横排群体，不可归进单体 EFF_FRIEND_ONE
+const EFF_FRIEND_ONE = new Set([2002, 2103, 2012, 2013, 2014, 2015, 2016]);
+const EFF_FRIEND_COL = new Set([2005, 2006, 2107]);
+const EFF_FRIEND_ROW = new Set([2008, 2009, 2110]);
 const EFF_FRIEND_ALL = new Set([2011, 2099, 2004]);
 const EFF_ANY_ONE = new Set([3101, 3105, 3006]);
 const EFF_ANY_COL = new Set([3102, 3103]);
@@ -2256,6 +2301,80 @@ function isAoeEffType(effType) {
 function isFriendEff(effType) {
   const e = Number(effType) || 0;
   return e === 2001 || EFF_FRIEND_ONE.has(e) || EFF_FRIEND_COL.has(e) || EFF_FRIEND_ROW.has(e) || EFF_FRIEND_ALL.has(e) || e === 4001;
+}
+
+// ---- 官方客户端 FightSkillMgr 站位几何（真机字节码逐行同构）----
+// 坐标系：x ∈ {±2, ±3, ±4} 前/中/后排（|x| 越小越靠前）；y ∈ {+1, 0, -1} 上/中/下三路（玩家口中“三排”）。
+// GetNearestOne：优先同路（|u.y - actor.y| 最小）→ 平距优先上路（u.y 更大）→ 同路优先最前排（|u.x| 最小）。
+function nearestOne(candidates, actor) {
+  if (!candidates || !candidates.length) return null;
+  if (!actor || !Array.isArray(actor.pos)) return candidates[0];
+  const ay = Number(actor.pos[1]) || 0;
+  let bestY = 999;
+  let best = null;
+  for (const u of candidates) {
+    if (!u || !Array.isArray(u.pos)) continue;
+    const uy = Number(u.pos[1]) || 0;
+    const ux = Math.abs(Number(u.pos[0]) || 0);
+    const d1 = Math.abs(uy - ay);
+    const d2 = Math.abs(bestY - ay);
+    const bestX = best && Array.isArray(best.pos) ? Math.abs(Number(best.pos[0]) || 0) : 999;
+    if (!best || d1 < d2 || (d1 === d2 && bestY < uy) || (uy === bestY && ux < bestX)) {
+      bestY = uy;
+      best = u;
+    }
+  }
+  return best || candidates[0];
+}
+// GetFrontEnemy：对敌方每一路 y 取最靠前（|x| 最小）的存活单位（各路排头）
+function frontEnemies(foes) {
+  const byLane = new Map();
+  for (const u of (foes || [])) {
+    if (!u || !Array.isArray(u.pos)) continue;
+    const y = Number(u.pos[1]) || 0;
+    const ax = Math.abs(Number(u.pos[0]) || 0);
+    const cur = byLane.get(y);
+    if (!cur || ax < Math.abs(Number(cur.pos[0]) || 0)) byLane.set(y, u);
+  }
+  return Array.from(byLane.values());
+}
+// GetFirstFrontEnemy（1002 前方对手 / 1051 前方直线对手定路）
+function firstFrontEnemy(actor, foes) {
+  return nearestOne(frontEnemies(foes), actor);
+}
+// GetBackEnemy：对敌方每一路 y 取最靠后（|x| 最大）的存活单位（各路排尾）
+function backEnemies(foes) {
+  const byLane = new Map();
+  for (const u of (foes || [])) {
+    if (!u || !Array.isArray(u.pos)) continue;
+    const y = Number(u.pos[1]) || 0;
+    const ax = Math.abs(Number(u.pos[0]) || 0);
+    const cur = byLane.get(y);
+    if (!cur || ax > Math.abs(Number(cur.pos[0]) || 0)) byLane.set(y, u);
+  }
+  return Array.from(byLane.values());
+}
+// GetFirstBackEnemy（1005 前方后排对手）
+function firstBackEnemy(actor, foes) {
+  return nearestOne(backEnemies(foes), actor);
+}
+// GetSortUnits + GetNearestOne（1009/1010/1011/1012/2013/2014/2015/2016 极值选目标）
+// dir = -1 取最大，dir = 1 取最小；并列时用 nearestOne 确定性破平
+function pickExtremeUnit(pool, prop, dir, actor) {
+  if (!pool || !pool.length) return null;
+  let extreme = null;
+  let tied = [];
+  for (const u of pool) {
+    if (!u) continue;
+    const v = Number(u[prop]) || 0;
+    if (extreme === null || (dir < 0 ? v > extreme : v < extreme)) {
+      extreme = v;
+      tied = [u];
+    } else if (v === extreme) {
+      tied.push(u);
+    }
+  }
+  return nearestOne(tied, actor);
 }
 // 目标集合解析（所有战斗 handler 的唯一入口）。
 // ⚠️ 签名契约（技术债收口 2026-10-26）：**6 参全传**。actor/skillId 缺失会让
@@ -2305,17 +2424,72 @@ function targetsOfEff(effType, side, units, main, actor, skillId) {
     }
     return main ? sameX(foes, main) : foes;
   }
-  if (EFF_FOE_COL.has(e)) return main ? sameY(foes, main) : foes;
-  if (e === 2001) return main && main.side === side ? [main] : friends.slice(0, 1); // 自身
+  if (EFF_FOE_COL.has(e)) {
+    // 1051 EFF_ENEMY_FRONT_COL_ALL（前方直线对手）：客户端 GetFirstFrontEnemy → EffTarCol，
+    // 先按 1002 同口径锁定“前方对手”所在一路 y，再命中该直线全部存活敌方
+    if (e === 1051 && actor) {
+      const head = firstFrontEnemy(actor, foes);
+      return head ? sameY(foes, head) : foes;
+    }
+    return main ? sameY(foes, main) : foes;
+  }
+  if (e === 2001) {
+    // 自身：有存活施术者时锁死自身（旧调用未传 actor 才回落 main）
+    if (actor && actor.hp > 0 && actor.side === side) return [actor];
+    return main && main.side === side ? [main] : friends.slice(0, 1);
+  }
   if (EFF_FRIEND_ALL.has(e)) return friends;
-  if (EFF_FRIEND_ROW.has(e)) return main && main.side === side ? sameX(friends, main) : friends;
-  if (EFF_FRIEND_COL.has(e)) return main && main.side === side ? sameY(friends, main) : friends;
-  if (EFF_FRIEND_ONE.has(e)) return main && main.side === side ? [main] : friends.slice(0, 1);
+  if (EFF_FRIEND_ROW.has(e)) {
+    // 2008 EFF_FRIEND_SELF_ROW_ONE（自身横排己方）：GetSelf → EffTarRow（同竖排 x 己方全员）
+    if (e === 2008) {
+      const pivot = (actor && actor.side === side) ? actor : main;
+      return pivot ? sameX(friends, pivot) : friends;
+    }
+    return main && main.side === side ? sameX(friends, main) : friends;
+  }
+  if (EFF_FRIEND_COL.has(e)) {
+    // 2005 EFF_FRIEND_SELF_COL_ONE（自身直线己方）：GetSelf → EffTarCol（同路 y 己方全员）
+    if (e === 2005) {
+      const pivot = (actor && actor.side === side) ? actor : main;
+      return pivot ? sameY(friends, pivot) : friends;
+    }
+    return main && main.side === side ? sameY(friends, main) : friends;
+  }
+  if (EFF_FRIEND_ONE.has(e)) {
+    // 幻梦专属己方单体几何（主线 0 使用）：
+    // 2012 前方队友 = GetFirstFrontSelf = nearestOne(friends, actor)（同路最前排队友，无则自身）
+    if (e === 2012) { const t = nearestOne(friends, actor); return t ? [t] : friends.slice(0, 1); }
+    if (e === 2013) { const t = pickExtremeUnit(friends, 'hp', -1, actor); return t ? [t] : friends.slice(0, 1); }
+    if (e === 2014) { const t = pickExtremeUnit(friends, 'hp', 1, actor); return t ? [t] : friends.slice(0, 1); }
+    if (e === 2015) { const t = pickExtremeUnit(friends, 'rage', -1, actor); return t ? [t] : friends.slice(0, 1); }
+    if (e === 2016) { const t = pickExtremeUnit(friends, 'rage', 1, actor); return t ? [t] : friends.slice(0, 1); }
+    if (e === 2103 && !main && friends.length) {
+      return [friends[Math.floor(Math.random() * friends.length)]];
+    }
+    return main && main.side === side ? [main] : friends.slice(0, 1);
+  }
   if (e === 3007) return alive;
   if (EFF_ANY_ROW.has(e)) return main ? sameX(alive, main) : alive;
   if (EFF_ANY_COL.has(e)) return main ? sameY(alive, main) : alive;
   if (EFF_ANY_ONE.has(e)) return main ? [main] : alive.slice(0, 1);
   if (EFF_FOE_ONE.has(e)) {
+    // 幻梦专属敌方单体几何先解析基准目标 baseMain，再走统一的天赋/嘲讽/挑拨改写链：
+    // 1002 前方对手 / 1005 前方后排对手 / 1009·1010 血量极值 / 1011·1012 怒气极值 /
+    // 1106 后排随机一体 / 1108 对手随机一体（!main 时随机，保留主线 aiChoose 确定性）
+    let baseMain = main;
+    if (e === 1002) baseMain = firstFrontEnemy(actor, foes);
+    else if (e === 1005) baseMain = firstBackEnemy(actor, foes);
+    else if (e === 1009) baseMain = pickExtremeUnit(foes, 'hp', -1, actor);
+    else if (e === 1010) baseMain = pickExtremeUnit(foes, 'hp', 1, actor);
+    else if (e === 1011) baseMain = pickExtremeUnit(foes, 'rage', -1, actor);
+    else if (e === 1012) baseMain = pickExtremeUnit(foes, 'rage', 1, actor);
+    else if (e === 1106 && !main && foes.length) {
+      const pool = backEnemies(foes);
+      baseMain = pool.length ? pool[Math.floor(Math.random() * pool.length)] : foes[0];
+    } else if (e === 1108 && !main && foes.length) {
+      baseMain = foes[Math.floor(Math.random() * foes.length)];
+    }
+
     // 112. 安格斯（22200 未逐之爱）：单体攻击技能目标固定为敌方能力等级最高者
     if (actor && actor.talent === 22200 && foes.length > 0) {
       const best = foes.slice().sort((a, b) => {
@@ -2326,37 +2500,42 @@ function targetsOfEff(effType, side, units, main, actor, skillId) {
       if (best) return [best];
     }
     // 115. 广目天（22240 清净天眼）：技能选择目标不会被改变（优先返回原始主目标）
-    if (actor && actor.talent === 22240 && main && main.side !== side) {
-      return [main];
+    if (actor && actor.talent === 22240 && baseMain && baseMain.side !== side) {
+      return [baseMain];
     }
-    // 技能级目标锁（批次H1 神明启示 10244 / 元素版警觉射击 10331 挂 skillTargetLocked）：
+    // 技能级目标锁（批次H1 神明启示 10244 / 元素版警觉射击 10331 挂 skillTargetLocked；
+    // 10341 引诱 挂 rule.targetUnchangeable）：
     // 「目标不会被改变」——与清净天眼同位（压过霍德尔随机/嘲讽/挑拨；安格斯的更强指向在其之前）
-    if (actor && actor.skillTargetLocked && main && main.side !== side) {
-      return [main];
+    const unchangeable = !!(actor && actor.skillTargetLocked)
+      || (skillId != null && !!(getSkillRule(skillId) && getSkillRule(skillId).targetUnchangeable));
+    if (unchangeable && baseMain && baseMain.side !== side) {
+      return [baseMain];
     }
     // 霍德尔（20760 混乱的黑暗）：单体攻击技能目标变为随机
     if (actor && actor.talent === 20760 && foes.length > 0) {
       return [foes[Math.floor(Math.random() * foes.length)]];
     }
 
-    if (actor && actor.tauntedBy && actor.talent !== 21840 && actor.talent !== 21240 && !actor.skillTargetLocked) {
+    if (actor && actor.tauntedBy && actor.talent !== 21840 && actor.talent !== 21240 && !unchangeable) {
       const taunter = foes.find(u => u.id === actor.tauntedBy);
       if (taunter) return [taunter];
     }
     // 挑拨离间（20530 拉塔托斯克）：「以其为对象的单体攻击技能，会随机转移到范围内的其他目标上」
     // 顺序：放在嘲讽之后（嘲讽是"强制转移"，挑拨是"被指定时的被动偏转"，嘲讽优先）；
-    //       22240 清净天眼 / skillTargetLocked 已在前面 return，天然压过本段。
+    //       22240 清净天眼 / skillTargetLocked / targetUnchangeable 已在前面 return，天然压过本段。
     // 「范围内」取主目标所在单体范围——即同一敌方阵营内除主目标外的存活者（官方无更细几何定义）。
-    if (main && main.side !== side && main.talent === 20530 && !(actor && actor.skillTargetLocked)) {
-      const others = foes.filter(u => u && u.hp > 0 && u.id !== main.id);
+    if (baseMain && baseMain.side !== side && baseMain.talent === 20530 && !unchangeable) {
+      const others = foes.filter(u => u && u.hp > 0 && u.id !== baseMain.id);
       if (others.length > 0) {
         return [others[Math.floor(Math.random() * others.length)]];
       }
     }
-    return main && main.side !== side ? [main] : foes.slice(0, 1);
+    return baseMain && baseMain.side !== side ? [baseMain] : foes.slice(0, 1);
   }
   // 未登记的 effType：按单体敌方兜底（与旧实现一致）
-  if (actor && actor.tauntedBy && actor.talent !== 21840 && actor.talent !== 21240 && !actor.skillTargetLocked) {
+  const fallbackUnchangeable = !!(actor && actor.skillTargetLocked)
+    || (skillId != null && !!(getSkillRule(skillId) && getSkillRule(skillId).targetUnchangeable));
+  if (actor && actor.tauntedBy && actor.talent !== 21840 && actor.talent !== 21240 && !fallbackUnchangeable) {
     const taunter = foes.find(u => u.id === actor.tauntedBy);
     if (taunter) return [taunter];
   }
@@ -2561,28 +2740,80 @@ function bestAttackChoice(unit, units, skills, candidateFoes) {
   return best;
 }
 
+// 己方一排（effType 2009 / 2110，如 10225 欢愉之宴）选排：
+// 优先存活人数最多的一排；平票时优先含低血（<50%）的排 → 含非自身队友更多的排（便于触发狄俄尼索斯 20220 等对队友生效天赋）→ 最低血量比更低的排；全过程确定性。
+function pickBestAllyRowLeader(unit, friends, lowHpThreshold = 0.5) {
+  if (!friends || !friends.length) return unit || null;
+  const byRow = new Map();
+  friends.forEach(f => {
+    const rk = (f && f.pos) ? Number(f.pos[0]) : 0;
+    if (!byRow.has(rk)) byRow.set(rk, []);
+    byRow.get(rk).push(f);
+  });
+  let best = null;
+  let bestKey = null;
+  Array.from(byRow.keys()).sort((a, b) => a - b).forEach(rk => {
+    const list = byRow.get(rk);
+    const count = list.length;
+    const hasLow = list.some(u => u.hp < (u.maxHp || 1) * lowHpThreshold) ? 1 : 0;
+    const nonSelf = list.filter(u => !unit || u.id !== unit.id).length;
+    const minRatio = Math.min(...list.map(u => u.hp / (u.maxHp || 1)));
+    const key = [count, hasLow, nonSelf, -minRatio];
+    if (!bestKey) { bestKey = key; best = list[0]; return; }
+    for (let i = 0; i < key.length; i++) {
+      if (key[i] !== bestKey[i]) {
+        if (key[i] > bestKey[i]) { bestKey = key; best = list[0]; }
+        break;
+      }
+    }
+  });
+  return best || unit || friends[0];
+}
+
 // 指定技能的目标解析（自行循环用；与 aiChoose 同款语义，但玩家钦点的技能不再做"是否值得放"判定）：
-// 纯治疗 → effType 2001 自身 / 其余血量比最低队友；增益（己方向）→ 自身；攻击 → 全敌评分取最优。
+// 天气 4001 → 自身；纯治疗 → 2001 自身 / 2009·2110 选最优己方排 / 其余血量比最低队友（狄俄尼索斯 20220 优先选其他队友）；
+// 己方辅助 → 2009·2110 选人数最多排 / 2002 且 20220 天赋优先选攻击最高队友 / 其余自身；攻击/敌方辅助 → 全敌评分或敌首。
 function choiceForSkill(unit, units, skillId) {
   const c = skillCfg(skillId);
   if (!c) return null;
   const side = unit.side;
+  const e = Number(c.effType) || 0;
   const friends = units.filter(u => u.hp > 0 && u.side === side);
   const foes = units.filter(u => u.hp > 0 && u.side !== side);
+  if (e === 4001) return { skillId, main: unit };
   if (c.healPct && !(c.power > 0)) {
     let main = null;
-    if (Number(c.effType) === 2001) main = unit;
-    else {
+    if (e === 2001) main = unit;
+    else if (EFF_FRIEND_ROW.has(e)) main = pickBestAllyRowLeader(unit, friends, 0.5);
+    else if (EFF_FRIEND_ONE.has(e) && unit.talent === 20220 && friends.some(f => f.id !== unit.id)) {
+      const others = friends.filter(f => f.id !== unit.id);
       let ratio = 2;
-      friends.forEach(f => { const r = f.hp / f.maxHp; if (r < ratio) { ratio = r; main = f; } });
+      others.forEach(f => { const r = f.hp / (f.maxHp || 1); if (r < ratio) { ratio = r; main = f; } });
+    } else {
+      let ratio = 2;
+      friends.forEach(f => { const r = f.hp / (f.maxHp || 1); if (r < ratio) { ratio = r; main = f; } });
     }
-    return { skillId, main };
+    return { skillId, main: main || unit };
   }
-  if (isFriendEff(c.effType)) return { skillId, main: unit };
-  const lockTaunter = (unit.tauntedBy && foes.find(u => u.id === unit.tauntedBy)) || null;
+  if (isFriendEff(e)) {
+    if (e === 2001) return { skillId, main: unit };
+    if (EFF_FRIEND_ROW.has(e)) return { skillId, main: pickBestAllyRowLeader(unit, friends, 0.5) || unit };
+    if (EFF_FRIEND_ONE.has(e) && unit.talent === 20220) {
+      const others = friends.filter(f => f.id !== unit.id);
+      if (others.length > 0) {
+        const bestOther = others.slice().sort((a, b) =>
+          (((b.attrs && b.attrs.phy_atk) || 0) + ((b.attrs && b.attrs.mag_atk) || 0))
+          - (((a.attrs && a.attrs.phy_atk) || 0) + ((a.attrs && a.attrs.mag_atk) || 0)))[0];
+        return { skillId, main: bestOther };
+      }
+    }
+    return { skillId, main: unit };
+  }
+  const rule = getSkillRule(skillId);
+  const lockTaunter = (!(rule && rule.targetUnchangeable) && unit.tauntedBy && foes.find(u => u.id === unit.tauntedBy)) || null;
   const pick = bestAttackChoice(unit, units, [{ id: skillId, pp: 1 }], lockTaunter ? [lockTaunter] : foes);
   if (pick) return pick;
-  return { skillId, main: foes[0] || null };
+  return { skillId, main: lockTaunter || foes[0] || null };
 }
 
 // ===================== 三百零三 B2 期望树搜索（实验开关 PS_AI_SEARCH=1/2；默认 0=纯贪心 B1） =====================
@@ -2638,6 +2869,12 @@ function searchSimAction(actor, choice, units, st, seed) {
   if (!targets.length) return false;
   try {
     const simSt = Object.assign({}, st || {}); // 浅拷贝：写盘进副本，数组/对象共享只读
+    if (st && st.enemyFields) {
+      simSt.enemyFields = {
+        0: st.enemyFields[0] ? Object.assign({}, st.enemyFields[0]) : undefined,
+        1: st.enemyFields[1] ? Object.assign({}, st.enemyFields[1]) : undefined,
+      };
+    }
     settleSkill(actor, cfg, targets, units, searchRng(seed), 0, simSt);
     applySkillEffects(actor, cfg, targets, units, 0, simSt);
   } catch (_) { return false; }
@@ -2715,44 +2952,63 @@ function autoChoose(actor, units, opts = {}) {
   if (!actor) return null;
   const mode = Number(process.env.PS_AI_SEARCH) || 0;
   const allyCtx = opts.allyCtx;
+  const allyOpts = { advanceCycle: !!opts.advanceCycle, cycleOwner: opts.cycleOwner };
   if (actor.side === 0 && allyCtx && (allyCtx.modeId === 6 || (allyCtx.modeId === 4 && allyCtx.modeValue > 0))) {
-    return allyChoose(actor, units, allyCtx);
+    return allyChoose(actor, units, allyCtx, allyOpts);
   }
   if (mode >= 1) {
     return aiChooseDeep(actor, units, { depth: Math.min(mode, 2), battleState: opts.battleState });
   }
-  return actor.side === 0 ? allyChoose(actor, units, allyCtx || {}) : aiChoose(actor, units);
+  return actor.side === 0 ? allyChoose(actor, units, allyCtx || {}, allyOpts) : aiChoose(actor, units);
 }
 // ===================== B2 结束 =====================
 
 // 作战策略我方选技（m_servant_ai_* 的战斗消费入口，map_fight/tower_fight/dream 三条战线共用）：
 // aiCtx = {modeId, modeValue}（handlers/skill_choice.aiCtxOf；undefined = 未配置 → 最优策略原行为）。
+// opts = { advanceCycle?: boolean, cycleOwner?: unit }（仅实际决策点传 advanceCycle:true 推进轮转指针；
+//   意图复算/优先度预测/测试预览不传 ⇒ 只读零副作用；幻梦战传入 shadow 时须附带 cycleOwner: actor 回写原单位）。
 // 客户端 autoSelSkill 对每个我方单位固定发 val=0 —— 策略计算全在服务端，这里就是「作战策略」的实战语义：
-//   modeId 6 自行：actor.aiSkills（誓灵存档 ai_skills，进场时由构建器带出）按序取第一个
-//                  池内且 pp>0 且 aiUsable 的技能（优先级列表，非轮转指针——不空放冷却技）；
-//                  空/全不可用 → aiChoose 兜底（不打空过）。
+//   modeId 6 自行：客户端文案「※预设战斗将根据选项的技能循环使用技能」——以 _aiCycleIdx 为轮转指针，
+//                  每回合从当前槽位起找第一个池内且 pp>0 且可用（含玩家显式钦点的 4001 天气召唤技）的技能，
+//                  实际决策时推进指针到 (idx+1)%len；空/全不可用 → aiChoose 兜底（不打空过）。
 //   modeId 4 value 1 单体至上：单体攻击技只打一个锁定目标（actor._aiLock；死了才换下一个；
 //                  首锁 = 最优策略会选的主目标）。单体技 pp 耗尽 → aiChoose（文案"用完单体技才会用其他技能"）。
 //   modeId 4 value 2 群体优先：存活敌 ≥2 时只从群体技（全体/一排/直线）里选评分最高；
 //                  无可用群体技 → aiChoose 兜底（严格照文案会空过整回合，绝大多数誓灵根本没有群攻技）。
 //   modeId 4 value 0 最优策略：aiChoose 原行为（不动）。
 // 手动选技（val>0）不走本函数——策略只在自动选技时介入。
-function allyChoose(actor, units, aiCtx) {
+function allyChoose(actor, units, aiCtx, opts = {}) {
   if (!actor) return null;
   const a = aiCtx || {};
   if (a.modeId !== 6 && !(a.modeId === 4 && a.modeValue > 0)) return aiChoose(actor, units);
-  const usable = actor.skills.filter(s => s.pp > 0 && aiUsable(skillCfg(s.id))
+  const allowWeather = a.modeId === 6; // 预设自行允许玩家显式排入的 4001 天气召唤技；aiUsable 自身不变，避免默认 AI 乱放天气
+  const usable = actor.skills.filter(s => {
+    if (!(s.pp > 0)) return false;
+    const c = skillCfg(s.id);
+    if (!(aiUsable(c) || (allowWeather && c && Number(c.effType) === 4001))) return false;
     // 心灵暗示（10003）/天击（10261）同 aiChoose 口径（批次H3）：作战策略分支不得绕过
-    && (!(actor.mindShackleCount > 0) || (actor.mindShackleSkillId != null && Number(s.id) === Number(actor.mindShackleSkillId)))
-    && (!((actor.noAttackRounds || 0) > 0) || !((c => c && (Number(c.type) === 1 || Number(c.type) === 2) && Number(c.power) > 0)(skillCfg(s.id)))));
+    if ((actor.mindShackleCount > 0) && !(actor.mindShackleSkillId != null && Number(s.id) === Number(actor.mindShackleSkillId))) return false;
+    if ((actor.noAttackRounds || 0) > 0 && (Number(c.type) === 1 || Number(c.type) === 2) && Number(c.power) > 0) return false;
+    return true;
+  });
   const foes = units.filter(u => u.hp > 0 && u.side !== actor.side);
   const lockTaunter = (actor.tauntedBy && foes.find(u => u.id === actor.tauntedBy)) || null;
   if (a.modeId === 6) {
     const cycle = Array.isArray(actor.aiSkills) ? actor.aiSkills : [];
-    for (const sid of cycle) {
-      if (!sid || !usable.some(s => s.id === sid)) continue; // 空槽/不在池/无次数/不可用 → 顺延下一优先级
-      const ch = choiceForSkill(actor, units, sid);
-      if (ch) return ch;
+    if (cycle.length > 0) {
+      const owner = (opts && opts.cycleOwner) || actor;
+      const len = cycle.length;
+      const start = ((Number(owner._aiCycleIdx) || 0) % len + len) % len;
+      for (let k = 0; k < len; k++) {
+        const idx = (start + k) % len;
+        const sid = Number(cycle[idx]) || 0;
+        if (!sid || !usable.some(s => Number(s.id) === sid)) continue; // 空槽/不在池/无次数/不可用 → 顺延下一槽位
+        const ch = choiceForSkill(actor, units, sid);
+        if (ch) {
+          if (opts && opts.advanceCycle) owner._aiCycleIdx = (idx + 1) % len;
+          return ch;
+        }
+      }
     }
     return aiChoose(actor, units);
   }
@@ -2865,6 +3121,14 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
   if (battleState && cfg && isSupportSkillCfg(cfg)) {
     battleState.supportUsedSide = battleState.supportUsedSide || {};
     battleState.supportUsedSide[actor.side] = true;
+  }
+  // 10291 风之返恩前置：记录「某队友在某回合对本单位使用过辅助技能」（仅记录非自身队友的支援，避免自拐触发返恩）
+  if (actor && cfg && (Number(cfg.type) === 3 || isSupportSkillCfg(cfg))) {
+    (targets || []).forEach(t => {
+      if (!t || t.hp <= 0 || t.side !== actor.side || t.id === actor.id) return;
+      t.supportedByRound = t.supportedByRound || {};
+      t.supportedByRound[actor.id] = currentRound;
+    });
   }
   // 彩虹之神使（21590 伊里丝）：自身使用辅助技能时，本回合所受伤害减少30%（回合末清）
   if (actor && actor.talent === 21590 && cfg && isSupportSkillCfg(cfg)) {
@@ -3151,11 +3415,18 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       const lr = skillRule.lifeReturn;
       const healOne = (u, pct) => {
         if (!u || u.hp <= 0) return;
-        const before = u.hp;
         const heal = Math.max(1, Math.round((u.maxHp || 1) * Number(pct) / 100 * healReceivedMul(u) * healDealtMul(actor)));
-        u.hp = Math.min(u.maxHp, u.hp + heal);
-        const real = Math.round(u.hp) - Math.round(before);
-        results.push({ target: u.id, hurt: -real, final_hp: u.hp, shield_hurt: 0, final_shield: Math.max(0, u.shield || 0), extra: 0 });
+        const res = applyHealWithSteal(u, heal, allUnits);
+        if (res.stolen) {
+          results.push({ target: u.id, hurt: 0, final_hp: u.hp, shield_hurt: 0, final_shield: Math.max(0, u.shield || 0), extra: 0 });
+          if (res.real > 0) wakeEffects.push({
+            trigger_count: 0, atk_servant_id: res.receiver.id, src_servant_id: res.receiver.id, tar_servant_ids: [res.receiver.id],
+            src_type: 3, src_id: 10151, id: 60120, effect_phase: phase,
+            change_type: 200000, change_value: [res.real], remove_round: 0,
+          });
+        } else {
+          results.push({ target: u.id, hurt: -res.real, final_hp: u.hp, shield_hurt: 0, final_shield: Math.max(0, u.shield || 0), extra: 0 });
+        }
       };
       targets.forEach(u => healOne(u, lr.healPct || 25));
       (allUnits || []).forEach(a => {
@@ -3169,14 +3440,21 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     // 旧实现在此提前 return 导致其目标（敌方）被"治疗"，伤害永不结算（2026-10-05 修复）。
     if (cfg.healPct && !(cfg.power > 0)) {
       const heal = Math.ceil((t.maxHp * cfg.healPct) / 100 * healReceivedMul(t) * healDealtMul(actor)); // 禁疗 ×0.25；攻方圣器回复量乘区
-      const after = Math.min(t.maxHp, t.hp + heal);
-      const overflow = heal - (after - t.hp);
-      results.push({ target: t.id, hurt: -(after - t.hp), final_hp: after, shield_hurt: 0, final_shield: Math.max(0, t.shield || 0), extra: 0 });
-      t.hp = after;
-      if (overflow > 0 && skillRule && skillRule.overflowHealStat) {
-        for (let i = 0; i < skillRule.overflowHealStat; i++) {
-          gainStat(t, [101, 102, 103, 104, 105][Math.floor(Math.random() * 5)], 1,
-            { effects: wakeEffects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: t.id, phase });
+      const res = applyHealWithSteal(t, heal, allUnits);
+      if (res.stolen) {
+        results.push({ target: t.id, hurt: 0, final_hp: t.hp, shield_hurt: 0, final_shield: Math.max(0, t.shield || 0), extra: 0 });
+        if (res.real > 0) wakeEffects.push({
+          trigger_count: 0, atk_servant_id: res.receiver.id, src_servant_id: res.receiver.id, tar_servant_ids: [res.receiver.id],
+          src_type: 3, src_id: 10151, id: 60120, effect_phase: phase,
+          change_type: 200000, change_value: [res.real], remove_round: 0,
+        });
+      } else {
+        results.push({ target: t.id, hurt: -res.real, final_hp: t.hp, shield_hurt: 0, final_shield: Math.max(0, t.shield || 0), extra: 0 });
+        if (res.overflow > 0 && skillRule && skillRule.overflowHealStat) {
+          for (let i = 0; i < skillRule.overflowHealStat; i++) {
+            gainStat(t, [101, 102, 103, 104, 105][Math.floor(Math.random() * 5)], 1,
+              { effects: wakeEffects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: t.id, phase });
+          }
         }
       }
       return;
@@ -4658,6 +4936,11 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     if (Number(cfg.power) > 0) {
       // 兴奋的秘泉（10168）：被祝福者造成的伤害翻倍（3回合；乘区与其它专属乘区同层）
       if ((actor.exciteSpringRounds || 0) > 0) exclusiveOutInMul *= (Number(actor.exciteSpringDmgMul) || 2.0);
+      // 星之传承（10216）：2回合内己方伤害提升 30% / 低血 60%
+      if ((actor.starLegacyRounds || 0) > 0) exclusiveOutInMul *= 1 + (Number(actor.starLegacyDmgPct) || 30) / 100;
+      // 慵懒氛围（10250）：处于敌方施加的慵懒氛围场地内，造成伤害降低 20%
+      const lazyField = battleState && battleState.enemyFields && battleState.enemyFields[actor.side] && battleState.enemyFields[actor.side].lazyAura;
+      if (lazyField && lazyField.rounds > 0) exclusiveOutInMul *= 1 - Math.min(1, (Number(lazyField.dmgDownPct) || 20) / 100);
       if (Number(actor.nextOutDmgUp) > 0) { exclusiveOutInMul *= 1 + Number(actor.nextOutDmgUp); actor.nextOutDmgUp = 0; }
       if (actor.nextRoundDmgUpRound === (battleState && battleState.round) && Number(actor.nextRoundDmgUp) > 0) {
         exclusiveOutInMul *= 1 + Number(actor.nextRoundDmgUp);
@@ -7607,6 +7890,12 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       const maxPp = Number((skillCfg(cfg.id) || {}).pp) || 0;
       if (slot && slot.pp < maxPp) slot.pp++;
     }
+    // 慵懒氛围（10250）：身处敌方施加的慵懒氛围中击杀目标 → 攻击者下一回合无法行动
+    if (after <= 0 && Number(hurt) > 0 && battleState && battleState.enemyFields
+        && battleState.enemyFields[actor.side] && battleState.enemyFields[actor.side].lazyAura
+        && battleState.enemyFields[actor.side].lazyAura.rounds > 0) {
+      actor.skipNextAction = true;
+    }
   });
 
   // 受击类天赋的演出统一在主伤害结果之后入列（顺序 = 客户端播报顺序：先命中、后反击）
@@ -7632,26 +7921,24 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     const healUnit = (u, amount) => {
       if (!u || u.hp <= 0 || !(amount > 0)) return;
       const amt = Math.round(amount * healReceivedMul(u) * healDealtMul(actor)); // 禁疗 ×0.25；攻方圣器回复量乘区
-      const capped = Math.min(u.maxHp, u.hp + amt);
-      const gained = capped - u.hp;
-      if (gained <= 0) return;
-      u.hp = capped;
+      const res = applyHealWithSteal(u, amt, allUnits);
+      if (res.real <= 0) return;
       // 客户端 FeatureLoop.showFeature 对 src_type=1（特性）的 effect 会拿 id/src_id 查 FightFeature
       // 特性表（第二参 true = 查不到 printError「不存在的特性ID」）——**不能放技能 ID**（10412/10406/10218
       // 都不在表内，2026-10-12 真机 16 连报错实证）。改用官方治疗展示特性 30531「回复的甘露」
       // （FightFeature.lua: act=20015 回血动画 + tips="#tar恢复了#value点生命"，#value=change_value[1]）。
-      // src_servant/atk_servant 仍指向施术者，飘字位置/回合归属不受影响。
+      // 被 10151 恩赐转移夺取时走 src_type=3, src_id=10151, id=60120 静默 HP 变更。
       wakeEffects.push({
         trigger_count: 0,
-        atk_servant_id: actor.id,
-        src_servant_id: actor.id,
-        tar_servant_ids: [u.id],
-        src_type: 1,
-        src_id: 30531,
-        id: 30531,
+        atk_servant_id: res.stolen ? res.receiver.id : actor.id,
+        src_servant_id: res.stolen ? res.receiver.id : actor.id,
+        tar_servant_ids: [res.receiver.id],
+        src_type: res.stolen ? 3 : 1,
+        src_id: res.stolen ? 10151 : 30531,
+        id: res.stolen ? 60120 : 30531,
         effect_phase: phase,
         change_type: 200000, // FIGHT_EFF_CHANGE_TYPE_HP（正值=治疗，客户端 FeatureLoop 取负显示）
-        change_value: [gained],
+        change_value: [res.real],
         remove_round: 0,
       });
     };
@@ -8065,14 +8352,15 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
         if (lv < 0) { gainStat(t, pr, -lv, { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: t.id, phase }); cleared += -lv; }
       });
       const pct = Number(hr.healPct || 25) + Number(hr.perClearPct || 5) * cleared;
-      const before = t.hp;
       const heal = Math.max(1, Math.round((t.maxHp || 1) * pct / 100 * healReceivedMul(t) * healDealtMul(actor)));
-      t.hp = Math.min(t.maxHp, t.hp + heal);
-      const real = Math.round(t.hp) - Math.round(before);
-      if (real > 0) effects.push({
-        trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [t.id],
-        src_type: 3, src_id: cfg.id, id: 60120, effect_phase: phase,
-        change_type: 200000, change_value: [real], remove_round: 0,
+      const res = applyHealWithSteal(t, heal, allUnits);
+      if (res.real > 0) effects.push({
+        trigger_count: 0,
+        atk_servant_id: res.stolen ? res.receiver.id : actor.id,
+        src_servant_id: res.stolen ? res.receiver.id : actor.id,
+        tar_servant_ids: [res.receiver.id],
+        src_type: 3, src_id: res.stolen ? 10151 : cfg.id, id: 60120, effect_phase: phase,
+        change_type: 200000, change_value: [res.real], remove_round: 0,
       });
     });
   }
@@ -8462,6 +8750,205 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
   }
   if (rule.springRounds) {
     targets.forEach(t => { if (t && t.hp > 0) t.springRounds = Math.max(t.springRounds || 0, rule.springRounds); });
+  }
+  // —— 2026-11-21 剩余 14 个缺规则辅助技实现 ——
+  if (rule.feastOfJoy) {
+    // 10225 欢愉之宴：HP < 50% 回复 15% 最大生命；HP >= 50% 随机 1 项能力等级 +1
+    const fj = rule.feastOfJoy;
+    const thr = Number(fj.threshold) || 0.5;
+    const hpPct = Number(fj.healPct) || 15;
+    const stDelta = Number(fj.statDelta) || 1;
+    const props = [101, 102, 103, 104, 105];
+    targets.forEach(t => {
+      if (!t || t.hp <= 0) return;
+      const maxH = t.maxHp || (t.attrs && t.attrs.hp) || 1;
+      if (t.hp < maxH * thr) {
+        const heal = Math.max(1, Math.round(maxH * hpPct / 100 * healReceivedMul(t) * healDealtMul(actor)));
+        const res = applyHealWithSteal(t, heal, allUnits);
+        if (res.real > 0) effects.push({
+          trigger_count: 0,
+          atk_servant_id: res.stolen ? res.receiver.id : actor.id,
+          src_servant_id: res.stolen ? res.receiver.id : actor.id,
+          tar_servant_ids: [res.receiver.id],
+          src_type: 3, src_id: res.stolen ? 10151 : cfg.id, id: 60120, effect_phase: phase,
+          change_type: 200000, change_value: [res.real], remove_round: 0,
+        });
+      } else {
+        gainStat(t, props[Math.floor(rnd() * props.length)], stDelta,
+          { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: t.id, phase });
+      }
+    });
+  }
+  if (rule.stealHealRounds) {
+    // 10151 恩赐转移：抢夺目标本回合所有回复效果（回合末递减清零）
+    const r = Number(rule.stealHealRounds) || 1;
+    targets.forEach(t => {
+      if (!t || t.hp <= 0) return;
+      t.healStealBy = actor.id;
+      t.healStealRounds = Math.max(t.healStealRounds || 0, r);
+    });
+  }
+  if (rule.starLegacy) {
+    // 10216 星之传承：使用者 HP>=40% → 2回合己方增伤 30%；HP<40% → 60%
+    const sl = rule.starLegacy;
+    const maxH = actor.maxHp || (actor.attrs && actor.attrs.hp) || 1;
+    const pct = (actor.hp < maxH * (Number(sl.hpThreshold) || 0.4))
+      ? (Number(sl.lowHpPct) || 60)
+      : (Number(sl.basePct) || 30);
+    const rounds = Number(sl.rounds) || 2;
+    (allUnits || []).filter(a => a && a.hp > 0 && a.side === actor.side).forEach(a => {
+      a.starLegacyRounds = Math.max(a.starLegacyRounds || 0, rounds);
+      a.starLegacyDmgPct = Math.max(Number(a.starLegacyDmgPct) || 0, pct);
+    });
+  }
+  if (rule.cityOfDevouringTime && battleState) {
+    // 10235 食时之城：3回合敌方场地回合末扣 5% 最大生命，施放者回复总损失 75% 且随机 1 项能力 +1
+    const cdt = rule.cityOfDevouringTime;
+    const foeSide = actor.side === 0 ? 1 : 0;
+    battleState.enemyFields = battleState.enemyFields || {};
+    battleState.enemyFields[foeSide] = battleState.enemyFields[foeSide] || {};
+    battleState.enemyFields[foeSide].devourTime = {
+      rounds: Number(cdt.rounds) || 3,
+      ownerId: actor.id,
+      hpLossPct: Number(cdt.hpLossPct) || 5,
+      healRatio: Number(cdt.healRatio) || 0.75,
+    };
+  }
+  if (rule.lazyAura && battleState) {
+    // 10250 慵懒氛围：3回合敌方场地造成伤害 -20%，且击杀我方后攻击者下回合无法行动
+    const la = rule.lazyAura;
+    const foeSide = actor.side === 0 ? 1 : 0;
+    battleState.enemyFields = battleState.enemyFields || {};
+    battleState.enemyFields[foeSide] = battleState.enemyFields[foeSide] || {};
+    battleState.enemyFields[foeSide].lazyAura = {
+      rounds: Number(la.rounds) || 3,
+      dmgDownPct: Number(la.dmgDownPct) || 20,
+    };
+  }
+  if (rule.freeBreath) {
+    // 10283 自由的呼吸：自损 15% 最大生命（保底 1），己方全体随机提升 1~2 级能力，HOLOLIVE 额外 +1
+    const fb = rule.freeBreath;
+    const costBefore = actor.hp;
+    const costAmt = Math.max(1, Math.round((actor.maxHp || 1) * (Number(fb.hpCostPct) || 15) / 100));
+    actor.hp = Math.max(1, actor.hp - costAmt);
+    if (actor.hp < costBefore) effects.push({
+      trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
+      src_type: 3, src_id: cfg.id, id: 60120, effect_phase: phase,
+      change_type: 200000, change_value: [-(costBefore - actor.hp)], remove_round: 0,
+    });
+    const minD = Number(fb.minDelta) || 1;
+    const maxD = Number(fb.maxDelta) || 2;
+    const extraH = Number(fb.hololiveExtra) || 1;
+    const props = [101, 102, 103, 104, 105];
+    (allUnits || []).filter(a => a && a.hp > 0 && a.side === actor.side).forEach(a => {
+      const base = minD + Math.floor(rnd() * (maxD - minD + 1));
+      const delta = base + (isHoloServant(a.type) ? extraH : 0);
+      gainStat(a, props[Math.floor(rnd() * props.length)], delta,
+        { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: a.id, phase });
+    });
+  }
+  if (rule.windRepay) {
+    // 10291 风之返恩：己方全体下次攻击增伤 30%；若该队友 5 回合内曾对施放者用过辅助技则为 60%
+    const wr = rule.windRepay;
+    const curRound = (battleState && battleState.round) || 1;
+    const win = Number(wr.windowRounds) || 5;
+    (allUnits || []).filter(a => a && a.hp > 0 && a.side === actor.side).forEach(a => {
+      const lastSup = actor.supportedByRound && actor.supportedByRound[a.id];
+      const boosted = lastSup != null && (curRound - Number(lastSup)) <= win;
+      const add = (boosted ? (Number(wr.boostedPct) || 60) : (Number(wr.basePct) || 30)) / 100;
+      a.nextOutDmgUp = (Number(a.nextOutDmgUp) || 0) + add;
+    });
+  }
+  if (rule.randomDefUpTarget) {
+    // 10310 宝幡：清除负面能力（走 clearNegativeTarget）+ 随机一项防御 +1
+    const d = Number(rule.randomDefUpTarget) || 1;
+    targets.forEach(t => {
+      if (!t || t.hp <= 0) return;
+      gainStat(t, rnd() < 0.5 ? 103 : 104, d,
+        { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: t.id, phase });
+    });
+  }
+  if (rule.mirrorClearSelfPositive) {
+    // 10335 百漠消解：自身所有正向能力等级归零，目标降低相应数量的同类能力等级
+    const props = [101, 102, 103, 104, 105, 111, 113, 115];
+    const pos = [];
+    props.forEach(p => {
+      const lv = (actor.statLevels && actor.statLevels[p]) || 0;
+      if (lv > 0) pos.push([p, lv]);
+    });
+    pos.forEach(([p, lv]) => {
+      gainStat(actor, p, -lv, { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: actor.id, phase });
+    });
+    if (pos.length) {
+      targets.forEach(t => {
+        if (!t || t.hp <= 0) return;
+        pos.forEach(([p, lv]) => {
+          gainStat(t, p, -lv, { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: t.id, phase });
+        });
+      });
+    }
+  }
+  if (rule.lureActNow) {
+    // 10341 引诱：使目标无视行动顺序立刻行动（三战线行动循环尾调 FC.applyLureReorder 提前至下一槽位）
+    targets.forEach(t => { if (t && t.hp > 0) t._lureActNow = true; });
+  }
+  if (rule.guardianSpirit) {
+    // 10358 守护灵：己方本回合受伤 -35%、受疗 +20%
+    const gs = rule.guardianSpirit;
+    const rounds = Number(gs.rounds) || 1;
+    (allUnits || []).filter(a => a && a.hp > 0 && a.side === actor.side).forEach(a => {
+      a.inDmgDownRounds = Math.max(a.inDmgDownRounds || 0, rounds);
+      a.inDmgDownPct = Math.max(Number(a.inDmgDownPct) || 0, Number(gs.dmgDownPct) || 35);
+      a.healUpRounds = Math.max(a.healUpRounds || 0, rounds);
+      a.healUpPct = Math.max(Number(a.healUpPct) || 0, Number(gs.healUpPct) || 20);
+    });
+  }
+  if (rule.lifeBloom) {
+    // 10365 生命绽放：己方全体添加 10% 护盾，消耗己方场上所有生命之种，每颗随机提升 1 项能力 1 级
+    const lb = rule.lifeBloom;
+    const allies = (allUnits || []).filter(a => a && a.hp > 0 && a.side === actor.side);
+    let totalSeeds = 0;
+    allies.forEach(a => {
+      const n = Number(a.lifeSeeds) || 0;
+      if (n > 0) {
+        totalSeeds += n;
+        a.lifeSeeds = 0;
+        effects.push({
+          trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [a.id],
+          src_type: 1, src_id: 60120, id: 60120, effect_phase: phase,
+          change_type: 300020, change_value: [22770], remove_round: 0,
+        });
+      }
+    });
+    const props = [101, 102, 103, 104, 105];
+    allies.forEach(a => {
+      const shieldVal = Math.max(1, Math.round((a.maxHp || 1) * (Number(lb.shieldPct) || 10) / 100));
+      exclusiveAddShield(actor, a, shieldVal, { effects, phase }, cfg.id);
+      for (let k = 0; k < totalSeeds; k++) {
+        gainStat(a, props[Math.floor(rnd() * props.length)], 1,
+          { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: a.id, phase });
+      }
+    });
+  }
+  if (rule.stealAndDistributeStats) {
+    // 10402 回归初始：清除目标所有能力等级，并将同等级同种类能力随机分配给己方全体
+    const props = [101, 102, 103, 104, 105, 111, 113, 115];
+    const allies = (allUnits || []).filter(a => a && a.hp > 0 && a.side === actor.side);
+    targets.forEach(t => {
+      if (!t || t.hp <= 0) return;
+      const entries = [];
+      props.forEach(p => {
+        const lv = (t.statLevels && t.statLevels[p]) || 0;
+        if (lv !== 0) entries.push([p, lv]);
+      });
+      entries.forEach(([p, lv]) => {
+        gainStat(t, p, -lv, { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: t.id, phase });
+        if (allies.length) {
+          const ally = allies[Math.floor(rnd() * allies.length)];
+          gainStat(ally, p, lv, { effects, srcId: cfg.id, srcType: 3, atkId: actor.id, srcServantId: ally.id, phase });
+        }
+      });
+    });
   }
   // 英勇之心（20280）：攻击类技能的"正面追加效果"全部消失（威力已在乘区补 +50%）
   // 判据：攻击技（type 1/2）+ 施术者有该天赋 → 跳过正向 statChanges / 增益 buff / 正向 randomStat
@@ -9246,6 +9733,8 @@ function settleRoundEndTicks(units, battleState) {
     if ((u.teamDmgDownRounds || 0) > 0) { u.teamDmgDownRounds -= 1; if (u.teamDmgDownRounds <= 0) u.teamDmgDownPct = 0; }
     if ((u.ascendRounds || 0) > 0) u.ascendRounds--;
     if ((u.inDmgDownRounds || 0) > 0) { u.inDmgDownRounds -= 1; if (u.inDmgDownRounds <= 0) u.inDmgDownPct = 0; }
+    if ((u.starLegacyRounds || 0) > 0) { u.starLegacyRounds -= 1; if (u.starLegacyRounds <= 0) u.starLegacyDmgPct = 0; }
+    if ((u.healUpRounds || 0) > 0) { u.healUpRounds -= 1; if (u.healUpRounds <= 0) u.healUpPct = 0; }
     if ((u.kingsGuardRounds || 0) > 0) u.kingsGuardRounds -= 1;
     if ((u.reflectDirectRounds || 0) > 0) u.reflectDirectRounds -= 1;
     if ((u.eternalReleaseRounds || 0) > 0) {
@@ -9406,15 +9895,18 @@ function settleRoundEndTicks(units, battleState) {
     if ((u.springRounds || 0) > 0 && u.hp > 0) {
       const maxH = u.maxHp || (u.attrs && u.attrs.hp) || u.hp;
       // 批次H1 禁疗覆盖修复：泉涌回血纳入禁疗（用回合初快照，healBan 递减行已在其前执行）
-      const gain = Math.max(1, Math.ceil(maxH / 12)) * roundEndHealMul;
-      const after = Math.min(maxH, u.hp + gain);
-      if (after > u.hp) {
+      // 2026-11-21：纳入 10151 恩赐转移偷疗
+      const gain = Math.round(Math.max(1, Math.ceil(maxH / 12)) * roundEndHealMul);
+      const res = applyHealWithSteal(u, gain, units);
+      if (res.real > 0) {
         effects.push({
-          trigger_count: 0, atk_servant_id: u.id, src_servant_id: u.id, tar_servant_ids: [u.id],
-          src_type: 3, src_id: 10008, id: 60120, effect_phase: 7,
-          change_type: 200000, change_value: [after - u.hp], remove_round: 0,
+          trigger_count: 0,
+          atk_servant_id: res.stolen ? res.receiver.id : u.id,
+          src_servant_id: res.stolen ? res.receiver.id : u.id,
+          tar_servant_ids: [res.receiver.id],
+          src_type: 3, src_id: res.stolen ? 10151 : 10008, id: 60120, effect_phase: 7,
+          change_type: 200000, change_value: [res.real], remove_round: 0,
         });
-        u.hp = after;
       }
       u.springRounds--;
     }
@@ -9498,6 +9990,7 @@ function settleRoundEndTicks(units, battleState) {
     if ((u.fragarachRounds || 0) > 0) u.fragarachRounds--;
     if ((u.brionacRounds || 0) > 0) u.brionacRounds--;
     if ((u.judgmentRounds || 0) > 0 && !u.judgmentPermanent) { u.judgmentRounds--; if (u.judgmentRounds <= 0) u.noPositiveRounds = 0; }
+    else if ((u.noPositiveRounds || 0) > 0 && !u.judgmentPermanent) { u.noPositiveRounds--; }
     if ((u.lightBearRounds || 0) > 0) {
       gainStat(u, Math.random() < 0.5 ? 103 : 104, 1, { effects, srcId: 10387, srcType: 3, atkId: u.id, srcServantId: u.id, phase: 7 });
       u.lightBearRounds--;
@@ -9681,20 +10174,20 @@ function settleRoundEndTicks(units, battleState) {
         const maxH = u.maxHp || (u.attrs && u.attrs.hp) || u.hp;
         // 批次H1 禁疗覆盖修复：圣器回合回血纳入禁疗（用回合初快照——递减行已在其前执行，
         // 直接调 healReceivedMul 会读到已递减的值，导致「5回合禁疗」的第 1 回合末圣水照回）
-        const gained = Math.min(maxH, u.hp + Math.ceil(maxH * heal.pct / 100 * roundEndHealMul)) - u.hp;
-        if (gained > 0) {
-          u.hp += gained;
+        const rawHeal = Math.ceil(maxH * heal.pct / 100 * roundEndHealMul);
+        const res = applyHealWithSteal(u, rawHeal, units);
+        if (res.real > 0) {
           effects.push({
             trigger_count: 0,
-            atk_servant_id: u.id,
-            src_servant_id: u.id,
-            tar_servant_ids: [u.id],
-            src_type: 1, // FIGHT_EFF_FEATURE
-            src_id: heal.feature,
-            id: heal.feature,
+            atk_servant_id: res.stolen ? res.receiver.id : u.id,
+            src_servant_id: res.stolen ? res.receiver.id : u.id,
+            tar_servant_ids: [res.receiver.id],
+            src_type: res.stolen ? 3 : 1, // FIGHT_EFF_FEATURE / SKILL(10151)
+            src_id: res.stolen ? 10151 : heal.feature,
+            id: res.stolen ? 60120 : heal.feature,
             effect_phase: 7, // TRIGGER_TIME_AFTER_ROUND
             change_type: 200000, // FIGHT_EFF_CHANGE_TYPE_HP（正值=治疗）
-            change_value: [gained],
+            change_value: [res.real],
             remove_round: 0,
           });
         }
@@ -10059,6 +10552,10 @@ function settleRoundEndTicks(units, battleState) {
     const allies = (units || []).filter(a => a && a.hp > 0 && a.side === frey.side);
     const enemies = (units || []).filter(e => e && e.hp > 0 && e.side !== frey.side);
     if (enemies.length > 0) {
+      // 按目标聚合本轮弗雷总追击伤害（保持逐队友计算与转火的精确数值，每个受击目标只发 1 条 22131）：
+      // 规避客户端 FeatureLoop.dealFeatureEff（真机字节码 PC 300-484）同桶同目标重复插入 effect_list
+      // 导致致死时 dieServant 入列两份同单位 → 二次 dieRemove 崩在 monsterData==nil 永久卡死战斗。
+      const dmgByTar = new Map();
       allies.forEach(ally => {
         const pAtk = (ally.statLevels && ally.statLevels[101]) || ally.phy_atk_lv || 0;
         const mAtk = (ally.statLevels && ally.statLevels[102]) || ally.mag_atk_lv || 0;
@@ -10071,21 +10568,24 @@ function settleRoundEndTicks(units, battleState) {
             const defVal = (tar.attrs ? tar.attrs.mag_def : (tar.mag_def || 100));
             const strikeDmg = Math.max(1, Math.round(((Number(frey.level) || 1) + 5) / 50 * (atkVal * higherAtk * 20) / Math.max(1, defVal)));
             tar.hp = Math.max(0, tar.hp - strikeDmg);
-            effects.push({
-              trigger_count: 0,
-              atk_servant_id: frey.id,
-              src_servant_id: frey.id,
-              tar_servant_ids: [tar.id],
-              src_type: 1,
-              src_id: 22130,
-              id: 22131, // 官方挥剑展示条目（act=20500）；22130 是 name-only 条目=客户端静默无演出
-              effect_phase: 7,
-              change_type: 200000,
-              change_value: [-strikeDmg],
-              remove_round: 0,
-            });
+            dmgByTar.set(tar.id, (dmgByTar.get(tar.id) || 0) + strikeDmg);
           }
         }
+      });
+      dmgByTar.forEach((totalDmg, tarId) => {
+        effects.push({
+          trigger_count: 0,
+          atk_servant_id: frey.id,
+          src_servant_id: frey.id,
+          tar_servant_ids: [tarId],
+          src_type: 1,
+          src_id: 22130,
+          id: 22131, // 官方挥剑展示条目（act=20500）；22130 是 name-only 条目=客户端静默无演出
+          effect_phase: 7,
+          change_type: 200000,
+          change_value: [-totalDmg],
+          remove_round: 0,
+        });
       });
     }
   });
@@ -11064,6 +11564,68 @@ function settleRoundEndTicks(units, battleState) {
     }
   });
 
+
+  // —— 2026-11-21 敌方场地效果（10235 食时之城 / 10250 慵懒氛围）回合末结算与递减 ——
+  if (battleState && battleState.enemyFields) {
+    const props5 = [101, 102, 103, 104, 105];
+    [0, 1].forEach(side => {
+      const field = battleState.enemyFields[side];
+      if (!field) return;
+      if (field.devourTime && field.devourTime.rounds > 0) {
+        const dt = field.devourTime;
+        const pct = Number(dt.hpLossPct) || 5;
+        let totalLoss = 0;
+        (units || []).forEach(u => {
+          if (!u || u.hp <= 0 || u.side !== side) return;
+          const maxH = u.maxHp || (u.attrs && u.attrs.hp) || u.hp;
+          const loss = Math.min(u.hp, Math.max(1, Math.round(maxH * pct / 100)));
+          if (loss <= 0) return;
+          u.hp = Math.max(0, u.hp - loss);
+          totalLoss += loss;
+          effects.push({
+            trigger_count: 0,
+            atk_servant_id: dt.ownerId || u.id,
+            src_servant_id: dt.ownerId || u.id,
+            tar_servant_ids: [u.id],
+            src_type: 3, src_id: 10235, id: 60120, effect_phase: 7,
+            change_type: 200000, change_value: [-loss], remove_round: 0,
+          });
+        });
+        if (totalLoss > 0) {
+          const owner = (units || []).find(x => x && x.hp > 0 && Number(x.id) === Number(dt.ownerId));
+          if (owner) {
+            const rawHeal = Math.max(1, Math.round(totalLoss * (Number(dt.healRatio) || 0.75) * healReceivedMul(owner)));
+            const res = applyHealWithSteal(owner, rawHeal, units);
+            if (res.real > 0) {
+              effects.push({
+                trigger_count: 0,
+                atk_servant_id: res.stolen ? res.receiver.id : owner.id,
+                src_servant_id: res.stolen ? res.receiver.id : owner.id,
+                tar_servant_ids: [res.receiver.id],
+                src_type: 3, src_id: res.stolen ? 10151 : 10235, id: 60120, effect_phase: 7,
+                change_type: 200000, change_value: [res.real], remove_round: 0,
+              });
+            }
+            gainStat(owner, props5[Math.floor(rnd() * props5.length)], 1,
+              { effects, srcId: 10235, srcType: 3, atkId: owner.id, srcServantId: owner.id, phase: 7 });
+          }
+        }
+        dt.rounds -= 1;
+        if (dt.rounds <= 0) delete field.devourTime;
+      }
+      if (field.lazyAura && field.lazyAura.rounds > 0) {
+        field.lazyAura.rounds -= 1;
+        if (field.lazyAura.rounds <= 0) delete field.lazyAura;
+      }
+    });
+  }
+  // 10151 恩赐转移：全回合所有治疗（含回合末泉涌/圣水/食时之城）结算完毕后递减清零
+  (units || []).forEach(u => {
+    if (u && (u.healStealRounds || 0) > 0) {
+      u.healStealRounds -= 1;
+      if (u.healStealRounds <= 0) { u.healStealRounds = 0; u.healStealBy = null; }
+    }
+  });
 
   // 效果展开：客户端 FeatureLoop.dealFeatureEff 按 **目标下标** 取 change_value[targetIdx]
   //（tools/lua_src/FeatureLoop.lua:465-477；飘字循环 :172-183 同规则）——一条 effect 只带
@@ -13432,9 +13994,32 @@ function bondChainCast(actor, targets, allUnits, actIndex, battleState) {
   return { castBy: t.id, skillId: sid, results, effects, pp: ((t.skills || []).find(x => Number(x.id) === sid) || {}).pp || 0 };
 }
 
+// 10341 引诱（lureActNow）：将本回合后续尚未行动且带 _lureActNow 标记的存活目标提前到下一行动槽位
+function applyLureReorder(actors, currentIdx) {
+  if (!Array.isArray(actors)) return false;
+  for (let i = 0; i <= currentIdx && i < actors.length; i++) {
+    if (actors[i] && actors[i]._lureActNow) actors[i]._lureActNow = false;
+  }
+  const insertAt = currentIdx + 1;
+  for (let i = insertAt; i < actors.length; i++) {
+    const u = actors[i];
+    if (!u || !u._lureActNow) continue;
+    u._lureActNow = false;
+    if (u.hp <= 0) continue;
+    if (i > insertAt) {
+      actors.splice(i, 1);
+      actors.splice(insertAt, 0, u);
+    }
+    return true;
+  }
+  return false;
+}
+
 module.exports = {
   natureOf, stepOf, stepOfStar, phyleOf, natureRelate, naturePer, MAGIC_ARROW, ABSORB_TALENT_NATURE,
-  calcAttrs, skillCfg, buildSkillPool, defaultSkills, buildUsingPool, aiUsable, targetsOfEff, resolveTargetPos, isFriendEff, aiChoose, allyChoose, bestAttackChoice, choiceForSkill, estDamageOf, aiChooseDeep, autoChoose, normalizeWeatherState, validateBattleState,
+  calcAttrs, skillCfg, buildSkillPool, defaultSkills, buildUsingPool, aiUsable, targetsOfEff, resolveTargetPos, isFriendEff,
+  nearestOne, frontEnemies, firstFrontEnemy, backEnemies, firstBackEnemy, pickExtremeUnit,
+  aiChoose, allyChoose, bestAttackChoice, choiceForSkill, estDamageOf, aiChooseDeep, autoChoose, normalizeWeatherState, validateBattleState,
   settleSkill, sortActors, applySkillPriorities, SKILL_PRIO_TABLE, skillChanceMul, NATURE_WEEK, feelCritBonus, feelHitBonus,
   attrLvMul, hitDodgeLvMul, effectiveSpeed, initUnitBattleState,
   applySkillEffects, checkUnitCanAct, settleRoundEndTicks, settleRoundStartTalents, settleBattleStartTalents,
@@ -13450,5 +14035,5 @@ module.exports = {
   talentOf, talentInfoOf, talentRuleOf,
   BID_LEFT_BASE, BID_RIGHT_BASE, newBidAllocator, isWireBid,
   elementAwakeOf, elementExclusiveOf, elementExclusiveBehavior, applyExclusiveCastEffects, elementReplacesBase,
-  healReceivedMul, isSupportSkillCfg, aiUsableList, bondChainCast,
+  healReceivedMul, applyHealWithSteal, isSupportSkillCfg, aiUsableList, bondChainCast, applyLureReorder,
 };

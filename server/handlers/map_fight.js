@@ -2287,7 +2287,7 @@ m_fight_skill_select_tos(conn, obj) {
     // 决策统一走 autoChoose（三百零三）：PS_AI_SEARCH=0 走贪心 B1（原行为）；1/2 走期望树搜索。
     // 作战策略模式（自行/单体/群体）在 autoChoose 内部优先于搜索。⚠️ 上方意图复算（2048/2068）
     // 保持 aiChoose depth0——搜索化会 430ms/回合（调研-自动战斗AI与魔法箭.md §四 B2 性能预算）。
-    if (!choice) choice = FC.autoChoose(actor, units, { allyCtx: SC.aiCtxOf(), battleState: st });
+    if (!choice) choice = FC.autoChoose(actor, units, { allyCtx: SC.aiCtxOf(), battleState: st, advanceCycle: true });
     // 10150 圣光之矢：目标下回合无法使用本回合用过的技能 → 锁定命中后换一个可用技能
     if (choice && actor.skillLock && actor.skillLockRound === st.round && actor.skillLock.includes(choice.skillId)) {
       const alt = (actor.skills || []).find(s => s.pp > 0 && !actor.skillLock.includes(s.id));
@@ -2557,6 +2557,9 @@ m_fight_skill_select_tos(conn, obj) {
         }
       }
     }
+
+    // 10341 引诱：把被点名目标提前到下一行动槽位（放在意图复算前，使后续意图顺序同步）
+    FC.applyLureReorder(actors, ai);
 
     // 攻击意图收口：行动者若为敌方且本次有敌方侧受击目标 → 意图定格为实际主目标；其余未行动敌方按当前战场复算
     if (actor.side !== 0) {

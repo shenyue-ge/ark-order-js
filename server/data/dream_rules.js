@@ -121,6 +121,38 @@ function costOfType(type) {
   return Number(D.FIGHT_COST.tiers[c - 1]) || 0;
 }
 
+// ---- 幻梦普攻（按擅长属性区分物/魔，与客户端 ServantConfigVO.getFantasyAttackType 同源）----
+// 物理属性冲击：水~暗取主表物理冲击（Skill.lua/CfgSkillDetail.lua type=1/nature/fightAct 全对齐），
+// 虚数属性取 60112 虚数冲击（客户端 CfgSkillDetail 复制粘贴标为 type=2，dreamSkillCfg 覆写回 type=1）。
+// 魔法普攻：复用 FC.MAGIC_ARROW（10018/10037/10050/10061/10071/10081/60113）。
+const PHY_IMPACT = {
+  1: 10016, // 水流冲击
+  2: 10030, // 火焰冲击
+  3: 10043, // 旋风冲击
+  4: 10055, // 碎岩冲击
+  5: 10066, // 光能冲击
+  6: 10076, // 暗影冲击
+  8: 60112, // 虚数冲击
+};
+const DREAM_BASIC_SKILLS = new Set([...Object.values(FC.MAGIC_ARROW), ...Object.values(PHY_IMPACT)]);
+function isBasicSkill(skillId) {
+  return DREAM_BASIC_SKILLS.has(Number(skillId));
+}
+// ServantConfigVO.getFantasyAttackType: phyle[物攻] < phyle[魔攻] → 魔法(2)，否则 → 物理(1)
+function fantasyAttackTypeOf(type, servant, star) {
+  const customPhyle = servant ? CH.phyleOf(servant) : undefined;
+  const st = star != null ? stepOfStar(star) : (servant && servant.star != null ? stepOfStar(servant.star) : undefined);
+  const ph = customPhyle || FC.phyleOf(type, st);
+  if (!ph) return 2; // 兜底魔法
+  return (Number(ph[1]) || 0) < (Number(ph[2]) || 0) ? 2 : 1;
+}
+function basicSkillOf(type, servant, star) {
+  const nat = FC.natureOf(type);
+  const atkType = fantasyAttackTypeOf(type, servant, star);
+  if (atkType === 1) return PHY_IMPACT[nat] || PHY_IMPACT[1];
+  return FC.MAGIC_ARROW[nat] || 10018;
+}
+
 // ---- 怒气技 ----
 function isRageSkill(skillId) {
   return D.RAGE_SKILLS[String(skillId)] != null;
@@ -129,14 +161,20 @@ function rageCostOf(skillId) {
   const r = D.RAGE_SKILLS[String(skillId)];
   return r ? Number(r.rageCost) || 0 : 0;
 }
-// 幻梦战技能配置：威力/命中/类型/PP 走主技能表，effType 被 CfgDream 覆盖
-// （SkillVO.getFightEffType 在 isDreamReady 且 hasRageSkill 时返回 CfgDream 的 effType）
+// 幻梦战技能配置：威力/命中/类型/PP 走主技能表，effType 被 CfgDream 覆盖；
+// 幻梦普攻统一覆写 effType=1002（前方对手，官方规则「普攻均是此攻击范围」），60112 虚数冲击修正为物理(type=1)。
 function dreamSkillCfg(skillId) {
   const base = FC.skillCfg(skillId);
   if (!base) return null;
-  const r = D.RAGE_SKILLS[String(skillId)];
-  if (!r) return base;
-  return Object.assign({}, base, { effType: r.effType, rageCost: Number(r.rageCost) || 0 });
+  const sid = Number(skillId);
+  const r = D.RAGE_SKILLS[String(sid)];
+  if (r) return Object.assign({}, base, { effType: r.effType, rageCost: Number(r.rageCost) || 0 });
+  if (DREAM_BASIC_SKILLS.has(sid)) {
+    const patch = { effType: 1002 };
+    if (sid === 60112) patch.type = 1; // 虚数冲击：客户端表误标为 2，服务端按物理结算
+    return Object.assign({}, base, patch);
+  }
+  return base;
 }
 // 誓灵默认怒气技 = servantRageSkills 首项（官方切换需暗噬混沌天赋满级，功能未实现）
 function defaultRageSkillOf(type) {
@@ -189,8 +227,13 @@ function healModeOf(barrier, side) {
 }
 
 // ---- 涨怒 ----
-function rageAfterRound(rage) {
-  return Math.min(RAGE_MAX, (Number(rage) || 0) + RAGE_PER_ROUND);
+// 御四家狂化天赋（97000 八岐大蛇/97010 凤凰/97020 麒麟/97030 天邪鬼）：「幻梦战时每次行动怒气额外增加25%」
+const BERSERK_RAGE_TALENTS = new Set([97000, 97010, 97020, 97030]);
+function rageAfterRound(rage, talent) {
+  const gain = BERSERK_RAGE_TALENTS.has(Number(talent))
+    ? Math.round(RAGE_PER_ROUND * 1.25)
+    : RAGE_PER_ROUND;
+  return Math.min(RAGE_MAX, (Number(rage) || 0) + gain);
 }
 function rageAfterHit(rage) {
   return Math.min(RAGE_MAX, (Number(rage) || 0) + RAGE_ON_HIT);
@@ -268,6 +311,7 @@ module.exports = {
   stepOfStar, dreamLevelOf, dreamAttrs, colorOf, costOfType,
   dreamGrowthOf, syncDreamLv,
   isRageSkill, rageCostOf, dreamSkillCfg, defaultRageSkillOf, rageSkillsOfType,
+  PHY_IMPACT, DREAM_BASIC_SKILLS, isBasicSkill, fantasyAttackTypeOf, basicSkillOf, BERSERK_RAGE_TALENTS,
   maxRoundOf, effectsOf, effectFlags, effectTipsOf, healModeOf,
   EFF_HEAL_SEAL, EFF_POWER_CAP, EFF_PRECISE, EFF_HEAL_SEAL_ALLY, EFF_HEAL_REVERSE,
   rageAfterRound, rageAfterHit,

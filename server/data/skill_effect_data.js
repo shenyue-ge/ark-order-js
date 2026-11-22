@@ -2554,7 +2554,50 @@ const SKILL_EFFECT_RULES = {
     "xuanYou": { "power": 60, "defUp": 1, "talentHits": 3 } },
   "10432": { "id": 10432, "name": "羁绊连环", "effType": 2002, "type": 3,
     // 「目标为青龙/朱雀/玄武时，立即释放其最后释放的技能（单体目标随机）；成功后自身跳过下次行动」
-    "bondChain": true }
+    "bondChain": true },
+  // —— 2026-11-21 剩余 14 个缺规则辅助技收口（全库 133 个可学 type=3 辅助技零缺口）——
+  "10225": { "id": 10225, "name": "欢愉之宴", "effType": 2009, "type": 3,
+    // 「若目标生命值<50%，回复最大生命值的15%；生命值≥50%，随机1项能力提升1级」（狄俄尼索斯专属）
+    "feastOfJoy": { "threshold": 0.5, "healPct": 15, "statDelta": 1 } },
+  "10151": { "id": 10151, "name": "恩赐转移", "effType": 1007, "type": 3,
+    // 「抢夺目标本回合的所有回复效果」——目标挂 healStealBy/healStealRounds=1（回合末清零）
+    "stealHealRounds": 1 },
+  "10216": { "id": 10216, "name": "星之传承", "effType": 2011, "type": 3,
+    // 「使用者HP≥40%时，使用后2回合内己方伤害提升30%；HP＜40%，伤害提升60%」
+    "starLegacy": { "rounds": 2, "hpThreshold": 0.4, "basePct": 30, "lowHpPct": 60 } },
+  "10235": { "id": 10235, "name": "食时之城", "effType": 1059, "type": 3,
+    // 「敌方场地进入【食时之城】3回合。回合结束时敌方损失最大生命值的5%,狂三回复损失生命总和的75%且随机1项能力提升1级」
+    "cityOfDevouringTime": { "rounds": 3, "hpLossPct": 5, "healRatio": 0.75 } },
+  "10250": { "id": 10250, "name": "慵懒氛围", "effType": 1059, "type": 3,
+    // 「敌方场地进入【慵懒氛围】3回合。敌方誓灵造成伤害降低20%，击杀我方后下一回合攻击者无法行动」
+    "lazyAura": { "rounds": 3, "dmgDownPct": 20 } },
+  "10283": { "id": 10283, "name": "自由的呼吸", "effType": 2011, "type": 3,
+    // 「损失自身最大生命15%，己方全体随机提升某项能力等级1-2级；若是HOLOLIVE所属誓灵额外提升1级」
+    "freeBreath": { "hpCostPct": 15, "minDelta": 1, "maxDelta": 2, "hololiveExtra": 1 } },
+  "10291": { "id": 10291, "name": "风之返恩", "effType": 2011, "type": 3,
+    // 「己方全体下一次攻击伤害提升30%；若五回合内该誓灵对技能使用者使用过辅助技能，则伤害提升量为60%」
+    "windRepay": { "basePct": 30, "boostedPct": 60, "windowRounds": 5 } },
+  "10306": { "id": 10306, "name": "赤龙索", "effType": 1007, "type": 3,
+    // 「三回合内，禁止敌方通过技能获得能力等级提升」——复用 noPositiveTargetRounds（独立递减）
+    "noPositiveTargetRounds": 3 },
+  "10310": { "id": 10310, "name": "宝幡", "effType": 2011, "type": 3,
+    // 「清除我方所有负面能力等级且随机一项防御上升1级」
+    "clearNegativeTarget": true, "randomDefUpTarget": 1 },
+  "10335": { "id": 10335, "name": "百漠消解", "effType": 1007, "type": 3,
+    // 「自身所有正向能力等级归零，敌方也降低相应数量的相关能力等级」
+    "mirrorClearSelfPositive": true },
+  "10341": { "id": 10341, "name": "引诱", "effType": 1007, "type": 3,
+    // 「该技能目标不会被改变，使目标无视行动顺序立刻行动」
+    "targetUnchangeable": true, "lureActNow": true },
+  "10358": { "id": 10358, "name": "守护灵", "effType": 2011, "type": 3,
+    // 「己方本回合内受到的伤害减少35%，受到治疗提升20%」
+    "guardianSpirit": { "rounds": 1, "dmgDownPct": 35, "healUpPct": 20 } },
+  "10365": { "id": 10365, "name": "生命绽放", "effType": 2011, "type": 3,
+    // 「添加10%护盾，消耗己方场上所有生命之种，提升随机n项能力等级1级（n为生命之种数量）」
+    "lifeBloom": { "shieldPct": 10 } },
+  "10402": { "id": 10402, "name": "回归初始", "effType": 1007, "type": 3,
+    // 「清除目标能力等级，并将同等级同种类的能力等级随机分配给己方全体」
+    "stealAndDistributeStats": true }
 }
 
 function getSkillRule(skillId) {

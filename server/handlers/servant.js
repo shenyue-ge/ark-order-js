@@ -526,7 +526,7 @@ function makeServantBrief(type) {  // 获得誓灵 ⇒ 图鉴激活（含狂化�
     team_ids: [],
     skill: [],
     learned_skills: [], // 已学习技能（技能面板/战斗技能栏都从这里下发）
-    rage_skill: 0,
+    rage_skill: CH.rageSkillOf({ type }), // 幻梦默认怒气技（重登前直接进银匙之门不报 skillID=0）
     // 羁绊（handlers/feeling.js）：feeling=当前羁绊值、satisfaction=升下一点的进度条 0~100、
     // feeling_record=里程碑时间戳 [{id:50|100, val:unix秒}]、pledge_time>0 才算已缔结灵契
     feeling_record: [],

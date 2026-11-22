@@ -27,8 +27,7 @@ const CH = require('../data/chaos_data');
 const { relicBonusOf } = require('../data/relic_data');
 const R = require('../data/dream_rules');
 const MF = require('./map_fight');
-const { makeServantBrief, usingSkillsOf } = require('./servant');
-const SC = require('./skill_choice'); // 作战策略（我方自动选技介入，FC.allyChoose）
+const { makeServantBrief } = require('./servant');
 const altarMod = require('./altar');
 const handbookMod = require('./handbook');
 
@@ -200,25 +199,21 @@ function costOfEmbattle() {
 
 // ================= 幻梦战斗引擎 =================
 // 与主线同一套 toc，但独立实现（不动 map_fight 主干）。差异全部来自客户端幻梦分支：
-//   ① 九宫格 9 格/边（主线 6 格）    ② PP 无限（不扣不推 SKILL_PP）
-//   ③ 怒气门槛（CfgDream.rageSkills 里的技能全部按 rageCost 计费）
-//   ④ effType 走 CfgDream 覆盖       ⑤ 回合上限 25/20/15 且超时判负
-//   ⑥ 替补：主力阵亡后按格补入，走 enter_list 增援路径（FightLoop.onBorn）
+//   ① 九宫格 9 格/边（主线 6 格），3 路站位锁排（前方对手/前方直线/前方队友等 23 种 effType）
+//   ② PP 无限（不扣不推 SKILL_PP）
+//   ③ 每只誓灵只携带「1 普攻（按擅长属性分物/魔）+ 1 怒气技（可在布阵面板替换）」
+//   ④ 回合开始判定怒气达标即放怒气技，不足则用普攻（强制自动，不吃主线 3 技能作战策略）
+//   ⑤ effType 走 CfgDream 覆盖（普攻统一 1002 前方对手）  ⑥ 回合上限 25/20/15 且超时判负
+//   ⑦ 替补：主力阵亡后按格补入，走 enter_list 增援路径（FightLoop.onBorn）
 const briefPosOf = tile => (tile[0] + 500) * 1000 + (tile[1] + 500);
-const MAGIC_ARROWS = new Set(Object.values(FC.MAGIC_ARROW));
+// 极少数允许自由挑目标的怒气技 effType（1007 光熊之拳 / 1052 任一直线×2 / 1056 任意一排×1）
+const FREE_CHOICE_EFFS = new Set([1007, 1052, 1056]);
 
-// 幻梦技能池：装备技/技能书 + 本属性魔法箭保底 + 该单位的怒气技。
-// 魔法箭保底对敌方也必须给：914 个幻梦怪里有 148 个技能书在其等级下只剩怒气技，
-// 不给保底会在攒够怒气前整只空过（客户端 FightSkillMgr 的幻梦分支同样允许非怒气技无条件出手）
-// 三百零二：我方池（buildUsingPool 内部）装备槽全空兜底默认技 + 空攻池补已学最强攻击技（learnedIds 透传）
-function dreamSkillPool(type, level, usingIds, rageSkill, learnedIds) {
-  const ids = usingIds != null
-    ? FC.buildUsingPool(type, usingIds, learnedIds)      // 我方：装备 3 槽 + 魔法箭（+空攻池补已学攻击技）
-    : FC.buildSkillPool(type, level, null).slice();      // 敌方：技能书按等级全学
-  if (usingIds == null) {
-    const arrow = FC.MAGIC_ARROW[FC.natureOf(type)] || 10018;
-    if (!ids.includes(arrow)) ids.push(arrow);
-  }
+// 幻梦技能池（官方口径）：严格 2 技 = [普攻（按擅长属性选魔法箭/属性冲击）, 唯一怒气技]。
+// 不再塞入我方主线 3 技能槽或敌方整本技能书；unitToc 下发这 2 技供客户端 checkAsset 预载动画。
+function dreamSkillPool(type, level, usingIds, rageSkill, learnedIds, servant, star) {
+  const basic = R.basicSkillOf(type, servant, star);
+  const ids = [basic];
   const rs = Number(rageSkill) || 0;
   if (rs > 0 && FC.skillCfg(rs) && !ids.includes(rs)) ids.push(rs);
   return ids;
@@ -245,12 +240,13 @@ function relicMiscOf(rb) {
 function mkUnit(o) {
   const attrs = R.dreamAttrs(o.type, o.level, o.star, o.servant);
   const ids = dreamSkillPool(o.type, o.level, o.usingIds, o.rageSkill,
-    o.servant && Array.isArray(o.servant.learned_skills) ? o.servant.learned_skills : null);
+    o.servant && Array.isArray(o.servant.learned_skills) ? o.servant.learned_skills : null,
+    o.servant, o.star);
   const unit = {
     id: o.id, type: o.type, nature: FC.natureOf(o.type), level: o.level, star: o.star,
     skin: o.skin, side: o.side, pos: o.pos.slice(), slot: o.slot,
     hp: attrs.hp, maxHp: attrs.hp, shield: 0, attrs,
-    rage: R.RAGE_START, rageSkill: Number(o.rageSkill) || 0,
+    rage: R.RAGE_START, basicSkill: ids[0], rageSkill: Number(o.rageSkill) || 0,
     skills: ids.map(id => ({ id, pp: (FC.skillCfg(id) || {}).pp || 30 })),
     dmgMul: o.dmgMul || 0, selfMit: o.selfMit || 0, teamMit: 0, dodge: 0,
     critLv: o.critLv || 0, critMul: o.critMul || 0, critMit: o.critMit || 0,
@@ -335,7 +331,7 @@ function buildFight(fightId, barrier) {
       id: b.id, type: b.type, level: R.dreamLevelOf(b), star: Number(b.star) || 5,
       skin: Number(b.skin_id) || 0, side: 0, slot: e.pos,
       pos: R.tileOfPos(e.pos < 10 ? e.pos : 1, true),
-      usingIds: usingSkillsOf(b),
+      usingIds: null,
       rageSkill: CH.rageSkillOf(b), servant: b,
       dmgMul: rb.dmgMul || 0,
       critLv: rb.critLv || 0,
@@ -469,12 +465,55 @@ function reinforce(f) {
 function affordable(u, sid) {
   return !R.isRageSkill(sid) || u.rage >= R.rageCostOf(sid);
 }
-// 精准打击（机制 3）：魔法箭系列改打后排（|x| 最大者）
+// 精准打击（机制 3）：全部幻梦普攻（魔法箭 + 属性冲击）优先攻击敌方后排（|x| 最大排，同路优先）
 function preciseTarget(f, actor, skillId, foes) {
-  if (!f.flags || !f.flags.precise || !MAGIC_ARROWS.has(Number(skillId)) || !foes.length) return null;
-  let best = foes[0];
-  for (const t of foes) if (Math.abs(t.pos[0]) > Math.abs(best.pos[0])) best = t;
-  return best;
+  if (!f.flags || !f.flags.precise || !R.isBasicSkill(skillId) || !foes.length) return null;
+  const maxX = Math.max(...foes.map(t => Math.abs(Number(t.pos[0]) || 0)));
+  const backRow = foes.filter(t => Math.abs(Number(t.pos[0]) || 0) === maxX);
+  return FC.nearestOne(backRow, actor);
+}
+// 幻梦专属技能决策（敌我同口径）：
+//   回合开始怒气达标即放唯一怒气技，不足则用普攻；不吃主线 3 技能作战策略（SkillChoice）。
+//   兼容冒烟测试直接覆写 u.skills、以及天击/永恒解脱/凝视/心灵暗示等异常限制。
+function dreamPickSkillId(u, manual) {
+  const skills = Array.isArray(u.skills) ? u.skills : [];
+  if (manual && skills.some(s => s.id === manual.skillId) && affordable(u, manual.skillId)) {
+    return Number(manual.skillId);
+  }
+  const has = sid => sid > 0 && skills.some(s => Number(s.id) === Number(sid));
+  const rageSid = has(u.rageSkill) ? Number(u.rageSkill)
+    : ((skills.find(s => R.isRageSkill(s.id)) || {}).id || 0);
+  const basicSid = has(u.basicSkill) ? Number(u.basicSkill)
+    : ((skills.find(s => !R.isRageSkill(s.id)) || {}).id || rageSid || R.basicSkillOf(u.type, u.servant, u.star));
+  const isAtk = sid => {
+    const c = R.dreamSkillCfg(sid);
+    return !!(c && (Number(c.type) === 1 || Number(c.type) === 2) && Number(c.power) > 0);
+  };
+  // 心灵暗示（10003）：只允许使用被锁定技能（怒气足够时）
+  if ((u.mindShackleCount || 0) > 0 && u.mindShackleSkillId != null) {
+    const ms = Number(u.mindShackleSkillId);
+    if (has(ms) && affordable(u, ms)) return ms;
+  }
+  // 凝视（10269）：禁用上次技能，另一技能可用则切换
+  if ((u.gazeRounds || 0) > 0 && u.gazeSkillId != null) {
+    const gs = Number(u.gazeSkillId);
+    if (gs === rageSid && basicSid && basicSid !== gs) return basicSid;
+    if (gs === basicSid && rageSid && rageSid !== gs && affordable(u, rageSid)) return rageSid;
+  }
+  // 天击（10261）/ 永恒解脱（10323）：封锁攻击技时，优先用可用的非攻击怒气技
+  if ((u.noAttackRounds || 0) > 0 || u.eternalReleased) {
+    if (rageSid && affordable(u, rageSid) && !isAtk(rageSid)) return rageSid;
+    if (basicSid && !isAtk(basicSid)) return basicSid;
+  }
+  // 标准幻梦规则：怒气足够 → 放怒气技；否则 → 普攻
+  if (rageSid && affordable(u, rageSid)) return rageSid;
+  return basicSid;
+}
+function dreamFallbackBasic(u) {
+  const skills = Array.isArray(u.skills) ? u.skills : [];
+  if (u.basicSkill && skills.some(s => Number(s.id) === Number(u.basicSkill))) return Number(u.basicSkill);
+  const nonRage = skills.find(s => !R.isRageSkill(s.id));
+  return nonRage ? Number(nonRage.id) : R.basicSkillOf(u.type, u.servant, u.star);
 }
 // 治疗修正（机制 1/4/5）。返回 p_fight_effect 条目数组
 function settleHeal(f, cfg, targets, mode) {
@@ -521,9 +560,10 @@ function resolveRound(f, selMap) {
   const fightList = [];
   const roundEffects = [];
   // 回合开始全员涨怒 → 每单位一条 200003 同步 effect（phase 7 = 回合开始结算段）
+  // 御四家狂化天赋（97000~97030）额外 +25% 怒气获取
   units.forEach(u => {
     if (u.hp > 0) {
-      u.rage = R.rageAfterRound(u.rage);
+      u.rage = R.rageAfterRound(u.rage, u.talent);
       roundEffects.push(rageEffect(u, 7));
     }
   });
@@ -532,9 +572,18 @@ function resolveRound(f, selMap) {
   if (startTalents.length) roundEffects.push(...startTalents);
   const aliveFoes = side => units.filter(u => u.hp > 0 && u.side !== side);
   const aliveFriends = side => units.filter(u => u.hp > 0 && u.side === side);
+  const manualOf = u => (u.side === 0 && selMap) ? (selMap[u.id] || (u.bid != null ? selMap[u.bid] : null) || null) : null;
 
-  FC.applySkillPriorities(units, f, null); // 批次E：官方技能优先度进排序
-  for (const actor of FC.sortActors(units, f)) {
+  // 回合开始快照全员本回合计划施放的技能（怒气达标即放怒气技，不足则普攻），
+  // 传给 applySkillPriorities 保证先制怒气技（+1 优先度）仅在真正施放的回合生效
+  const plannedMap = {};
+  units.forEach(u => {
+    if (u.hp > 0) plannedMap[u.id] = dreamPickSkillId(u, manualOf(u));
+  });
+  FC.applySkillPriorities(units, f, plannedMap); // 批次E：官方技能优先度进排序
+  const actors = FC.sortActors(units, f);
+  for (let ai = 0; ai < actors.length; ai++) {
+    const actor = actors[ai];
     if (actor.hp <= 0) continue;
     if (!aliveFoes(actor.side).length) break;
 
@@ -576,48 +625,50 @@ function resolveRound(f, selMap) {
       continue;
     }
 
-    // 决策：我方尊重手动选择（须在池内且怒气够），否则 AI；AI 只在可负担技能里选
-    let choice = null;
-    const manual = actor.side === 0 ? selMap[actor.id] : null;
-    if (manual && actor.skills.some(s => s.id === manual.skillId) && affordable(actor, manual.skillId)) {
-      let main = null;
-      if (manual.targetPos) {
-        const tx = Math.floor(manual.targetPos / 1000) - 500, ty = (manual.targetPos % 1000) - 500;
-        const foes = aliveFoes(actor.side);
-        main = foes.find(e => e.pos[0] === tx && e.pos[1] === ty)
-          || foes.find(e => Math.abs(e.pos[0]) === Math.abs(tx) && e.pos[1] === ty) || null;
-      }
-      const mc = R.dreamSkillCfg(manual.skillId);
-      if (mc && (mc.healPct && !(mc.power > 0) || FC.isFriendEff(mc.effType)) && !main) { // 复合攻击技仍默认打敌人
-        let ratio = 2;
-        aliveFriends(actor.side).forEach(x => { const r = x.hp / x.maxHp; if (r < ratio) { ratio = r; main = x; } });
-      }
-      if (!main) main = (mc && FC.isFriendEff(mc.effType)) ? actor : aliveFoes(actor.side)[0];
-      choice = { skillId: manual.skillId, main };
-    }
-    if (!choice) {
-      const shadow = Object.assign({}, actor, { skills: actor.skills.filter(s => affordable(actor, s.id)) });
-      // 三百零三：autoChoose——PS_AI_SEARCH=0 贪心 B1，1/2 期望树（shadow 带怒气过滤后的池；
-      // 搜索 sim 内敌回应不扣怒气属已知近似，评估略保守）。
-      choice = FC.autoChoose(shadow, units, { allyCtx: SC.aiCtxOf(), battleState: f });
-    }
-    let cfg = R.dreamSkillCfg(choice.skillId);
-    // 暗噬 1101 是幻梦战基础攻击威力加成；只作用于属性魔法箭（怒气技仍走 CfgDream 原威力）。
-    if (cfg && actor.side === 0 && MAGIC_ARROWS.has(Number(choice.skillId)) && actor.servant) {
+    // 决策：采用回合开始快照的技能（若回合中怒气被吸干导致不再足够，则回落普攻）
+    const manual = manualOf(actor);
+    let skillId = plannedMap[actor.id] || dreamPickSkillId(actor, manual);
+    if (!affordable(actor, skillId)) skillId = dreamFallbackBasic(actor);
+    let cfg = R.dreamSkillCfg(skillId);
+    // 暗噬 1101 是幻梦战普攻威力加成；作用于全部幻梦普攻（魔法箭 + 属性冲击），怒气技仍走 CfgDream 原威力
+    if (cfg && actor.side === 0 && R.isBasicSkill(skillId) && actor.servant) {
       const add = CH.attackAddOf(actor.servant);
       if (add) cfg = Object.assign({}, cfg, { power: Number(cfg.power || 0) + add });
     }
-    if (!cfg || !affordable(actor, choice.skillId)) continue;
-    const pt = preciseTarget(f, actor, choice.skillId, aliveFoes(actor.side));
-    if (pt) choice.main = pt;
-    const friendEff = FC.isFriendEff(cfg.effType);
-    let targets = [];
-    if ((cfg.healPct && !(cfg.power > 0)) || friendEff) { // 纯治疗/增益技；复合攻击技按攻击技走敌方过滤
-      targets = FC.targetsOfEff(cfg.effType, actor.side, units, choice.main, actor, cfg.id);
-    } else {
-      targets = FC.targetsOfEff(cfg.effType, actor.side, units, choice.main, actor, cfg.id).filter(t => t.side !== actor.side);
+    if (!cfg || !affordable(actor, skillId)) continue;
+
+    // 目标解析：绝大多数幻梦 effType（1002/1051/1010/1011/1106/1108/2005/2008/2012/2014/2016/2103 等）
+    // 由 targetsOfEff 严格按官方站位/条件几何决定；仅对少数“任意选择”类（1007/1052/1056）及精准打击指定 main。
+    const foesNow = aliveFoes(actor.side);
+    let main = null;
+    let effTypeForTargets = cfg.effType;
+    const pt = preciseTarget(f, actor, skillId, foesNow);
+    if (pt) {
+      main = pt;
+      effTypeForTargets = 1007; // 精准打击覆写普攻 1002，直指后排同路目标（仍走嘲讽/天赋链）
+    } else if (FREE_CHOICE_EFFS.has(Number(cfg.effType))) {
+      if (manual && manual.targetPos) {
+        main = FC.resolveTargetPos(foesNow, manual.targetPos);
+      }
+      if (!main) {
+        const best = FC.bestAttackChoice(actor, units, [{ id: skillId, pp: 1 }], foesNow);
+        main = (best && best.main) || foesNow[0] || null;
+      }
     }
-    if (!targets.length) targets = friendEff ? [actor] : (choice.main ? [choice.main] : []);
+
+    const friendEff = FC.isFriendEff(effTypeForTargets);
+    let targets = [];
+    if (Number(effTypeForTargets) === 4001) {
+      // 幻梦 effType=4001 包含 6 个天气技 + 6 个屏障/场地技（10001/10002/10009/10235/10250/10241）：
+      // 10241 冰之结界在 skill_effect_data 中按 target 施加减速，传敌方全体防落 [actor] 自减速；其余传 [actor] 走天气/全队/场地分支
+      targets = (Number(cfg.id) === 10241) ? foesNow : [actor];
+    } else if ((cfg.healPct && !(cfg.power > 0)) || friendEff) {
+      targets = FC.targetsOfEff(effTypeForTargets, actor.side, units, main, actor, cfg.id);
+    } else {
+      targets = FC.targetsOfEff(effTypeForTargets, actor.side, units, main, actor, cfg.id).filter(t => t.side !== actor.side);
+    }
+    if (!targets.length) targets = friendEff ? [actor] : (main ? [main] : foesNow.slice(0, 1));
+    const choice = { skillId, main };
 
     // 梦境治疗封锁/反转只作用于纯治疗技；复合攻击技（天之甘露等）正常走伤害结算
     const isPureHeal = !!(cfg.healPct && !(cfg.power > 0));
@@ -669,10 +720,11 @@ function resolveRound(f, selMap) {
       result: 0,
     });
     actIndex++;
+    FC.applyLureReorder(actors, ai);
   }
 
   // 回合末异常状态伤害扣减与持续时间自然衰减
-  const endTicks = FC.settleRoundEndTicks(units);
+  const endTicks = FC.settleRoundEndTicks(units, f);
   if (endTicks.length) roundEffects.push(...endTicks);
 
   fightList.roundEffects = roundEffects;

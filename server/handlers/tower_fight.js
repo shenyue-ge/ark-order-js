@@ -383,7 +383,9 @@ function resolveRound(f, selMap) {
   }
 
   FC.applySkillPriorities(units, f, null); // 批次E：官方技能优先度进排序
-  for (const actor of FC.sortActors(units, f)) {
+  const actors = FC.sortActors(units, f);
+  for (let ai = 0; ai < actors.length; ai++) {
+    const actor = actors[ai];
     if (actor.hp <= 0) continue;
     if (!aliveFoes(actor.side).length) break;
 
@@ -443,7 +445,7 @@ function resolveRound(f, selMap) {
     }
     // 决策统一走 autoChoose（三百零三；自律派遣 auto_fight 经 resolveRound 同步继承）：
     // PS_AI_SEARCH=0 走贪心 B1（原行为），1/2 走期望树。作战策略模式内部优先于搜索。
-    if (!choice) choice = FC.autoChoose(actor, units, { allyCtx: SC.aiCtxOf(), battleState: f });
+    if (!choice) choice = FC.autoChoose(actor, units, { allyCtx: SC.aiCtxOf(), battleState: f, advanceCycle: true });
     const cfg = FC.skillCfg(choice.skillId);
     if (!cfg) continue;
 
@@ -511,6 +513,7 @@ function resolveRound(f, selMap) {
       actor.hp += heal;
       fightList.push(healEntry(actor, heal));
     }
+    FC.applyLureReorder(actors, ai);
   }
 
   // 回合末异常状态伤害扣减与自然衰减

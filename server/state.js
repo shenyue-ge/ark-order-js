@@ -626,6 +626,10 @@ function loadState() {
       S.feelingState = s.feelingState;
       if (!S.feelingState.battleGain) S.feelingState.battleGain = {};
       if (!Array.isArray(S.feelingState.dormChecked)) S.feelingState.dormChecked = [];
+      // 触摸（大厅立绘）每日计数：{count, sat, lastTs}，老档没有就补 0
+      if (!S.feelingState.touch || typeof S.feelingState.touch !== 'object') {
+        S.feelingState.touch = { count: 0, sat: 0, lastTs: 0 };
+      }
     }
     // 主线首通奖励/双倍：整块懒初始化在 handlers/story_reward.js st()（含每日购买次数重置），这里只做形状修复
     if (s.exState) {

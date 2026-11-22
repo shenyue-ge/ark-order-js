@@ -115,6 +115,63 @@ function MainFunctionPanel.onChangeHelp(slot0, slot1, slot2)
 	end
 end
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 本地服修改：立绘触摸涨羁绊（触摸好感）——只给"大厅主页面立绘点击"打 play_type=3
+--
+-- 背景：触摸没有专用协议，客户端只借图鉴语音上报
+--   m_role_handbook_play_cv_tos{servant_type_id, cv_id, play_type}
+-- 而 play_type=2 同时来自图鉴点播 / 详情页立绘 / 养成自动上报等 12 个调用方，
+-- 服务端无法区分"大厅里真的摸了角色"。
+--
+-- 做法：不改 MainFunctionPanel 的原函数体，只包两层——
+--   · onCardClick：置实例标记 __psTouchFromCard，跑完原函数后清掉（异常也清）；
+--   · playCv：只有该标记在、且没有被 timeOutKey 提前拦下时，才在原调用
+--     （仍是 play_type=2，保持图鉴"听过"逻辑原样）之后**追加一条** play_type=3。
+--   ⇒ 其余调用方（onActPredeal 登录语音 / updateCardView 待机语音 / 详情页 / 养成 / 战斗）
+--     一个字节都不变，只有大厅立绘触摸会多发这条标记包。
+--
+-- 兼容性：服务端未实现触摸时只把 play_type=3 当普通 play_cv 吃掉（回 m_common_reply_toc），
+--   不会报错、不会断线；反过来，未打本补丁的客户端大厅触摸仍发 2 ⇒ 服务端不计数（功能不生效）。
+-- 安装时机：本文件已 require MainFunctionPanel；createModulePanelFunc 只登记工厂，
+--   面板实例化与 initHandler 绑定 onCardClick 都更晚，因此替换对实例生效。
+-- ─────────────────────────────────────────────────────────────────────────────
+do
+	if type(MainFunctionPanel) == "table"
+		and type(MainFunctionPanel.onCardClick) == "function"
+		and type(MainFunctionPanel.playCv) == "function" then
+		local _psRawOnCardClick = MainFunctionPanel.onCardClick
+		local _psRawPlayCv = MainFunctionPanel.playCv
+
+		MainFunctionPanel.onCardClick = function(self, eventData)
+			self.__psTouchFromCard = true
+			local ok, err = pcall(_psRawOnCardClick, self, eventData)
+			self.__psTouchFromCard = false
+			if not ok then
+				error(err)
+			end
+		end
+
+		MainFunctionPanel.playCv = function(self, typeId, cvId)
+			-- 与原函数同一个提前返回口径：上一句台词还没消失时不会播新语音，也就不算一次触摸
+			local touch = self.__psTouchFromCard and not self.timeOutKey
+			local r1, r2 = _psRawPlayCv(self, typeId, cvId)
+			if touch and typeId and cvId and type(Net) == "table" and type(Net.createAndSendProto) == "function" then
+				-- 上报失败也不能影响 UI：触摸是"副作用"，断线/未连接时静默跳过
+				pcall(Net.createAndSendProto, "m_role_handbook_play_cv_tos", {
+					servant_type_id = typeId,
+					cv_id = cvId,
+					play_type = 3
+				})
+			end
+			return r1, r2
+		end
+
+		print("PS-TOUCH-FEELING installed")
+	else
+		print("PS-TOUCH-FEELING skip: MainFunctionPanel 不可用（" .. type(MainFunctionPanel) .. "）")
+	end
+end
+
 __msgList = {}
 __netList = {}
 

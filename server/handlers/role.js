@@ -899,16 +899,20 @@ function gmDispatch(conn, msg) {
     // m21_skin=<皮肤ID>：解锁任意皮肤（含灵契皮肤，自测皮肤/灵契图鉴）
     const skinId = parseInt(parts[1]);
     if (!skinId) return false;
-    if (!S.skinState.owned.includes(skinId)) S.skinState.owned.push(skinId);
-    if (!S.skinState.l2dOwned) S.skinState.l2dOwned = [];
+    if (!S.skinState) S.skinState = { owned: [], l2dOwned: [] };
+    if (!Array.isArray(S.skinState.owned)) S.skinState.owned = [];
+    if (!Array.isArray(S.skinState.l2dOwned)) S.skinState.l2dOwned = [];
+    const hadSkinBefore = S.skinState.owned.includes(skinId);
+    if (!hadSkinBefore) S.skinState.owned.push(skinId);
     const cfg = require('../skin_config.json');
-    const hasLive2d = (cfg.live2dSkins || []).includes(skinId) ? 1 : 0;
+    const hasLive2d = (cfg.live2dSkins || []).includes(skinId);
     if (hasLive2d && !S.skinState.l2dOwned.includes(skinId)) S.skinState.l2dOwned.push(skinId);
     const hb = require('./handbook');
     if (hb.onSkinObtained(skinId)) hb.pushSkinRedPoints(conn);
     saveState();
-    conn.sendToc('m_servant_shop_active_skin_toc', { skin_type_id: skinId, gain_live: hasLive2d, gain_servant: 0 });
-    log(`[GM] 解锁皮肤 ${skinId}`);
+    const gainServant = require('./servant').skinGainServantFlag(skinId, hadSkinBefore);
+    conn.sendToc('m_servant_shop_active_skin_toc', { skin_type_id: skinId, gain_live: hasLive2d ? 2 : 0, gain_servant: gainServant });
+    log(`[GM] 解锁皮肤 ${skinId}（gain_live=${hasLive2d ? 2 : 0}, gain_servant=${gainServant}）`);
     return true;
   }
   if (cmd === 'm21_guide_reset' && parts.length >= 2) {

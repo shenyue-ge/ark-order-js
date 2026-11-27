@@ -44,6 +44,37 @@ const SKIN_CFG = (() => {
     return { types: j.types || {}, itemToSkin: j.itemToSkin || {}, live2dSkins: j.live2dSkins || [] };
   } catch (e) { return { types: {}, itemToSkin: {}, live2dSkins: [] }; }
 })();
+
+// 皮肤 ID → 本体誓灵 typeId 反查表（优先查 skin_config.json.types，兼容 5★ 形态壳皮肤，回落 floor(id/100)）
+const SKIN_TO_SERVANT_TYPE = (() => {
+  const map = new Map();
+  for (const [st, arr] of Object.entries(SKIN_CFG.types || {})) {
+    const typeId = Number(st);
+    if (!typeId || !Array.isArray(arr)) continue;
+    for (const entry of arr) {
+      const sid = Number(entry && entry.skinID);
+      if (sid) map.set(sid, typeId);
+    }
+  }
+  return map;
+})();
+function skinToServantType(skinId) {
+  const sid = Number(skinId) || 0;
+  if (!sid) return 0;
+  return SKIN_TO_SERVANT_TYPE.get(sid) || Math.floor(sid / 100);
+}
+// m_servant_shop_active_skin_toc.gain_servant 三档契约（真机 ServantModule.lua 伪汇编 PC 1–43 实证）：
+//   0 = 当前未持有该誓灵 → hasServantLocked=false → ServantNewSkinPanel 弹 Tips「未获得的誓灵，在获得誓灵后可立即激活对应的皮肤」
+//   1 = 当前持有该誓灵且购买前未拥有原画皮 → hasServantLocked=true, hasSkin=false → 不弹未拥有提示，点击后询问「是否将装束更换为『XXX』」
+//   2 = 当前持有该誓灵且此前已拥有原画皮（如单独升级 L2D opt=2 / 重复解锁）→ hasServantLocked=true, hasSkin=true → 不弹未拥有提示且不重复询问换装
+// 持有判定按当前在册 S.servants（与客户端 ServantNewSkinVO:isOwnThisServant 同源，图鉴激活但已全部分解按未持有处理）。
+function skinGainServantFlag(skinId, hadSkinBefore) {
+  const typeId = skinToServantType(skinId);
+  if (!typeId) return 0;
+  const ownsServant = Array.isArray(S.servants) && S.servants.some(s => Number(s.type) === typeId);
+  if (!ownsServant) return 0;
+  return hadSkinBefore ? 2 : 1;
+}
 const { MAP_CONFIGS } = require('../data/map_configs');
 
 // 阵型启用场位表（CfgCopy.arrays，data/lineup_data.js 统一维护）：lineup 1-6 → 该阵型可站立的格子编号
@@ -1372,20 +1403,23 @@ m_role_freeshop_get_goods_tos(conn, obj) {
   conn.sendToc('m_role_freeshop_get_goods_toc', { goods_id: goodsId, num });
   const skinId = SKIN_CFG.itemToSkin[goodsId];
   if (skinId) {
-    if (!S.skinState.owned.includes(skinId)) S.skinState.owned.push(skinId);
-    if (!S.skinState.l2dOwned) S.skinState.l2dOwned = [];
-    const hasLive2d = (SKIN_CFG.live2dSkins || []).includes(skinId) ? 1 : 0;
+    if (!S.skinState) S.skinState = { owned: [], l2dOwned: [] };
+    if (!Array.isArray(S.skinState.owned)) S.skinState.owned = [];
+    if (!Array.isArray(S.skinState.l2dOwned)) S.skinState.l2dOwned = [];
+    const hadSkinBefore = S.skinState.owned.includes(skinId);
+    if (!hadSkinBefore) S.skinState.owned.push(skinId);
+    const hasLive2d = (SKIN_CFG.live2dSkins || []).includes(skinId);
     if (hasLive2d && !S.skinState.l2dOwned.includes(skinId)) S.skinState.l2dOwned.push(skinId);
     saveState();
     // 新皮肤 → 皮肤图鉴红点/is_new（延迟 require 解循环依赖）
     const hb = require('./handbook');
     if (hb.onSkinObtained(skinId)) { saveState(); hb.pushSkinRedPoints(conn); }
-    // gain_live：皮肤在 live2dSkins 列表时回 1（拥有 Live2D，不自动开启本地开关）。
-    // 回 0 会把客户端 updateHasOwnLive2d 缓存写成 false，覆盖 state 查询结果 → 开关失灵
+    // gain_live：真机 ServantModule.lua PC 17 仅认 gain_live == 2（置 updateHasOwnLive2d=true 与 isActL2D=true；
+    // 旧值 1 会被当 false 覆写缓存）；gain_servant：0 未持有誓灵 / 1 持有且首获 / 2 持有且已有原画皮。
     conn.sendToc('m_servant_shop_active_skin_toc', {
       skin_type_id: skinId,
-      gain_live: hasLive2d,
-      gain_servant: 0,  // 已拥有该誓灵（1/2 会当"誓灵未拥有"处理）
+      gain_live: hasLive2d ? 2 : 0,
+      gain_servant: skinGainServantFlag(skinId, hadSkinBefore),
     });
     log(`[skin] GM 免费商店解锁皮肤 item=${goodsId} skin=${skinId}`);
   } else {
@@ -1842,7 +1876,7 @@ m_servant_decompose_tos(conn, obj) {
 // 玩家在设置里改看板娘组：保存并回显。
 // 客户端 updateHelpGroup 语义：helper = 组首位——若记录的看板娘被移出组，跟随回退到新组首位
   },
-  buildFormation: buildFormation, pushTeamReset: pushTeamReset, battleRosterOf: battleRosterOf, teamServantOf: teamServantOf, makeServantBrief: makeServantBrief, pushServantsBrief: pushServantsBrief, pushHelperGroup: pushHelperGroup, helperOrderIds: helperOrderIds, sendFormationBriefs: sendFormationBriefs, servantDetailOf: servantDetailOf, SKIN_CFG: SKIN_CFG, scrubServantRefs: scrubServantRefs, skinTocPayload: skinTocPayload, pushMarrySkinRefresh: pushMarrySkinRefresh,
+  buildFormation: buildFormation, pushTeamReset: pushTeamReset, battleRosterOf: battleRosterOf, teamServantOf: teamServantOf, makeServantBrief: makeServantBrief, pushServantsBrief: pushServantsBrief, pushHelperGroup: pushHelperGroup, helperOrderIds: helperOrderIds, sendFormationBriefs: sendFormationBriefs, servantDetailOf: servantDetailOf, SKIN_CFG: SKIN_CFG, skinToServantType: skinToServantType, skinGainServantFlag: skinGainServantFlag, scrubServantRefs: scrubServantRefs, skinTocPayload: skinTocPayload, pushMarrySkinRefresh: pushMarrySkinRefresh,
   briefedIds: briefedIds, pushPendingServants: pushPendingServants, grantServantBrief: grantServantBrief, briefableServants: briefableServants,
   pendingBriefServants: pendingBriefServants,
   pushLineupInfo: pushLineupInfo, pushLineupIfChanged: pushLineupIfChanged, unlockedLineups: unlockedLineups,

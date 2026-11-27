@@ -72,13 +72,13 @@ function consumeItem(conn, itemId, n) {
   }
 }
 
-// ── info：m_role_summon_info_tos → 卡池列表 + 灵契召唤挂载 + 保底计数 ──
+// ── info：m_role_summon_info_tos → 卡池列表 + 保底计数 ──
 function buildInfoList() {
   const s = st();
   const list = [];
   for (const p of SD.POOLS) {
     if (!R.isPoolOpen(p.id, s.closed, nowSec())) continue;
-    if (!R.poolWeights(p.id) && p.id !== R.AFFINITY_POOL_ID) continue;
+    if (!R.poolWeights(p.id)) continue;
     const isNewbieClosed = p.id === R.NEWBIE_POOL_ID && (s.pulls[p.id] || 0) >= R.NEWBIE_TOTAL_LIMIT;
     if (isNewbieClosed) continue; // 抽满 20 次客户端本地也会移除（setTimes→clearSummonVO）
     list.push({
@@ -97,8 +97,13 @@ function buildInfoList() {
 
 function handleSummonInfo(conn) {
   const s = st();
-  // select_list：act_id=12 把灵契召唤挂进卡池列表（客户端 getSummonVO(act_id) 建 VO，pool_id=0=未定向）
-  const selectList = [{ act_id: R.AFFINITY_POOL_ID, pool_id: 0, total_times: 0, protect_times: 0, select_times: 0, day_times: 0 }];
+  // select_list：官方仅用于定向自选 UP 池（isSelect=true）。
+  // 不可把神谕/灵契召唤（id=12）塞进 select_list：官方客户端 SummonMgr.initSummonList 已显式
+  // 跳过 id=12，并将其重构成独立 PopupPanel 迁至「唤灵殿堂 → 召唤」（CopyDarePanel.onClickBtnSummon
+  // → SummonModule.openAffinityView）。经 select_list 强塞进 SummonPanel 会激活废弃的
+  // updateNormalAffinity 遗留路径：二次打开只走 setActive(true) 不入 WindowsManager.panelStack，
+  // 导致点关闭按钮（btnClose → WindowsManager.close）永远返回 false、页面彻底卡死无法关闭。
+  const selectList = [];
   // protect_list：保底计数（p_kvi {id: poolId, val: 计数}），面板显示 "x/150"
   const protectList = R.PITY_POOLS
     .filter(p => (s.pity[p.poolId] || 0) > 0)

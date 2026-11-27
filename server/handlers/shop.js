@@ -357,14 +357,15 @@ m_shop_buy_tos(conn, obj) {
       gain_live = 0;
     }
 
+    const gain_servant = require('./servant').skinGainServantFlag(def.skin_id, baseOwned);
     saveState();
     L.pushAssetChange(conn);
     conn.sendToc('m_shop_buy_toc', { shop_id: shopId, id: gid, num, opt });
-    conn.sendToc('m_servant_shop_active_skin_toc', { skin_type_id: def.skin_id, gain_live, gain_servant: 0 });
+    conn.sendToc('m_servant_shop_active_skin_toc', { skin_type_id: def.skin_id, gain_live, gain_servant });
     // 新皮肤 → 皮肤图鉴红点/is_new（打开对应图鉴页签时清零）
     const hb = require('./handbook');
     if (hb.onSkinObtained(def.skin_id)) { saveState(); hb.pushSkinRedPoints(conn); }
-    log(`[shop] 购买皮肤 ${def.skin_id}（${def.type_id}），opt=${opt}，扣水晶 ${cost}，已激活 gain_live=${gain_live}`);
+    log(`[shop] 购买皮肤 ${def.skin_id}（${def.type_id}），opt=${opt}，扣水晶 ${cost}，已激活 gain_live=${gain_live} gain_servant=${gain_servant}`);
     return;
   }
   // collab 特例：加速引擎（buff 1108，StarDreamPermitView 引擎轨解锁）与誓灵（22/33 直接入队）

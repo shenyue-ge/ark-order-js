@@ -20,6 +20,17 @@ build/pslocal/babel/node_modules/
 build/pslocal/PsLocalServer/Boot/SeedStamp.g.cs
 build/**/bin/
 build/**/obj/
+build64/out64/
+build64/staging/
+build64/reports/
+build64/unity_project/
+build64/_trash/
+build64/native/**/*.so
+build64/native/**/*.jar
+build64/native/**/*.dex
+build64/native/**/*.class
+build64/native/**/build/
+build64/native/**/obj/
 
 # --- machine-local external inputs (game files & secrets, not distributable) --
 fzzl/

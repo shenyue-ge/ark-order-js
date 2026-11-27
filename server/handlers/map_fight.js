@@ -814,7 +814,7 @@ function pushFightRound(conn, fightId, round, fightList, batchIdx, updates, roun
         }
       });
     } else if (S.fightState && S.fightState.allies) {
-      // 转场续战：保留余血与已耗技能次数
+      // 转场续战：保留余血、护盾与已耗技能次数（能力等级与 Buff 已在 start 处按客户端 onFightLoopEnd2 口径重置）
       S.fightState.allies.forEach(a => { if (a.hp > 0) allies.push(a); });
     }
     // 敌方：按当前战斗点当前波取阵容，镜像站位 x 取反。
@@ -2001,6 +2001,12 @@ m_fight_servant_start_tos(conn, obj) {
   S.fightState.batch = batch;
   S.fightState.round = 1; // 新波次回合重置
   S.fightState.over = 0;  // 转场续战开启新波（上一波的全灭标记清掉）
+  // 多波转场：必须在 substituteBench 之前清空上一波存活我方的属性等级与 Buff，
+  // 对齐客户端 onFightLoopEnd2 的 removeAllAdditionAttr/revmoeAllBuff/removeAllSkillState，
+  // 同时避免误清刚上位的替补在 mkAllyUnit 中生成的初始状态（如圣器 critLv）。
+  if (batch > 1 && Array.isArray(S.fightState.allies)) {
+    S.fightState.allies.forEach(a => { if (a && a.hp > 0) FC.resetUnitForNextWave(a); });
+  }
   substituteBench(S.fightState); // 波转场：上一波阵亡的主力由替补顶替（enter 随新波首包下发）
   conn.sendToc('m_fight_servant_start_toc', {
     fight_id: fightId,

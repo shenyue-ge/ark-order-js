@@ -117,7 +117,6 @@ const ELEMENT_REPLACE_BASE = new Set([
   '2545004:10387',                  // 光熊之拳：专属层已含全队版
   '1341001:10123',                  // 灭世的海啸：专属层已含击倒/暴雨例外
   '2541002:10268',                  // 挥鞭击流：专属层已含 +1/+1
-  '1245009:10299',                  // 耀雨之光棘：专属层已含自伤 1/3
   '3043005:10307',                  // 诸天主宰：专属层已含天赐消耗+能力
   '3242002:10332',                  // 末世的乐观：专属层已含全队清负
   '1242013:10352',                  // 魔法锅：专属层已含团队同步
@@ -262,6 +261,25 @@ function applyHealWithSteal(target, rawHeal, allUnits) {
   const overflow = Math.max(0, rawHeal - real);
   recv.hp = after;
   return { receiver: recv, real, overflow, stolen: !!stealer };
+}
+
+function unitMaxHpOf(u) {
+  return Math.max(1, Number((u && (u.maxHp || (u.attrs && u.attrs.hp) || u.hp)) || 1));
+}
+
+// 方案 A：按生命百分比平均分配，返回逐人 { unit, before, after, delta }
+// 满血异上限队伍 avgRatio=1 零失血；残血队伍拉齐血量百分比，存活单位至少保留 1 HP
+function averageUnitsHpByRatio(unitList) {
+  const alive = (unitList || []).filter(u => u && u.hp > 0);
+  if (alive.length === 0) return [];
+  const avgRatio = alive.reduce((s, u) => s + (u.hp / unitMaxHpOf(u)), 0) / alive.length;
+  return alive.map(u => {
+    const maxHp = unitMaxHpOf(u);
+    const before = u.hp;
+    const after = Math.max(1, Math.min(maxHp, Math.round(maxHp * avgRatio)));
+    u.hp = after;
+    return { unit: u, before, after, delta: after - before };
+  });
 }
 
 // 攻方「回复量提升」乘区（联动圣器专属段，2026-10-25）：
@@ -505,6 +523,7 @@ function chargeVoid(unit, amount, effects, phase, srcAtkId, rng) {
     return 0;
   }
   unit.void_energy = Math.min(100, before + Number(amount));
+  pushStackBuffEffect(effects, { buffId: 21910, stacks: unit.void_energy, tarId: unit.id, srcId: 21910, srcServantId: unit.id, atkId: srcAtkId != null ? srcAtkId : unit.id, phase });
   if (unit.void_energy >= 100) fireVoidFull(unit, effects, phase, srcAtkId, rng);
   return unit.void_energy - before;
 }
@@ -607,7 +626,12 @@ function applyExclusiveCastEffects(actor, cfg, targets, results, ctx) {
     if (cfg.id === 10368 && damaged(t)) { // 二次冻结：敌方全体 40%，每层财布 +15%
       let layers = 0;
       (c.units || []).filter(x => x && x.hp > 0 && x.side === actor.side && (x.talent === 22810 || x.talent === 22820))
-        .forEach(x => { layers += Number(x.walletLayers) || 0; x.walletLayers = 0; });
+        .forEach(x => {
+          const prevW = Number(x.walletLayers) || 0;
+          layers += prevW;
+          x.walletLayers = 0;
+          if (prevW > 0 && x.talent === 22810) pushStackBuffEffect(fx, { buffId: 22810, stacks: 0, tarId: x.id, srcId: 22810, srcServantId: x.id, atkId: actor.id, phase: ph });
+        });
       const pct = 0.40 + 0.15 * layers;
       exclusiveSplash(actor, mainHurt, foes().filter(x => x.id !== t.id).map(x => [x, pct]), results);
     }
@@ -644,11 +668,6 @@ function applyExclusiveCastEffects(actor, cfg, targets, results, ctx) {
         });
         t.buffs = {};
       }
-    }
-    if (cfg.id === 10299 && damaged(t) && c.curWeather !== WEATHER_IDS.LIGHT && mainHurt > 0) { // 耀雨之光棘：自伤 1/3
-      const self = Math.max(1, Math.round(mainHurt / 3));
-      actor.hp = Math.max(0, actor.hp - self);
-      results && results.push({ target: actor.id, hurt: self, final_hp: actor.hp, shield_hurt: 0, final_shield: Math.max(0, actor.shield || 0), extra: 0 });
     }
     if (cfg.id === 10029 && damaged(t)) { // 黄泉逆流
       const relNow = natureRelate(cfg.nature, t.nature);
@@ -973,16 +992,14 @@ function applyExclusiveCastEffects(actor, cfg, targets, results, ctx) {
       applyExclusiveBuff(actor, x, [BUFF_IDS.BURN, BUFF_IDS.PARALYSIS, BUFF_IDS.POISON][Math.floor(Math.random() * 3)], 100, 3, c);
     });
   }
-  if (cfg.id === 10356) { // 丰满的麦穗：全队随机 3 项 +1 并平均分配生命
+  if (cfg.id === 10356) { // 丰满的麦穗：全队随机 3 项 +1 并按生命百分比平均分配生命（方案A）
     const allies = (c.units || []).filter(x => x && x.hp > 0 && x.side === actor.side);
     allies.forEach(a => [101, 102, 103, 104, 105, 111, 113, 115].sort(() => Math.random() - 0.5).slice(0, 3)
       .forEach(p => gs(a, p, 1, 10356)));
-    const total = allies.reduce((s2, a) => s2 + a.hp, 0);
-    const each = Math.floor(total / Math.max(1, allies.length));
-    allies.forEach(a => {
-      const to = Math.min(a.maxHp, each);
-      if (to !== a.hp) results && results.push({ target: a.id, hurt: -(to - a.hp), final_hp: to, shield_hurt: 0, final_shield: Math.max(0, a.shield || 0), extra: 0 });
-      a.hp = to;
+    averageUnitsHpByRatio(allies).forEach(({ unit: a, after, delta }) => {
+      if (delta !== 0 && results) {
+        results.push({ target: a.id, hurt: -delta, final_hp: after, shield_hurt: 0, final_shield: Math.max(0, a.shield || 0), extra: 0 });
+      }
     });
   }
   if (cfg.id === 10378) actor.mentalMathRounds = 4;
@@ -1357,7 +1374,42 @@ function flattenEffects(effects) {
   return out;
 }
 
-// ---- 特性"演出"（2026-10-20 工单：次元料理联动天赋没有演出动画）----
+// 统一推送天赋/状态 buff 图标层数同步（三百一十三 / 2026-11-22 同族收口）：
+//   stacks > 0 → 300019 ADD_BUFF + encodeBuffVal(buffId, stacks)
+//   stacks <= 0 → 300020 REDUCE_BUFF + [buffId]（id=60120 静默摘图标，兼容 isZeroHide=true/false）
+function pushStackBuffEffect(effects, { buffId, stacks, tarId, srcId, srcServantId, atkId, phase, showBanner = false, removeRound = 0 }) {
+  if (!effects || !tarId || !buffId) return;
+  const n = Math.max(0, Math.round(Number(stacks) || 0));
+  if (n > 0) {
+    effects.push({
+      trigger_count: 0,
+      atk_servant_id: atkId != null ? atkId : (srcServantId != null ? srcServantId : tarId),
+      src_servant_id: srcServantId != null ? srcServantId : tarId,
+      tar_servant_ids: [tarId],
+      src_type: showBanner ? 1 : 3,
+      src_id: showBanner ? (srcId || buffId) : 60120,
+      id: showBanner ? (srcId || buffId) : 60120,
+      effect_phase: phase,
+      change_type: 300019,
+      change_value: [encodeBuffVal(buffId, n)],
+      remove_round: removeRound || 0,
+    });
+  } else {
+    effects.push({
+      trigger_count: 0,
+      atk_servant_id: atkId != null ? atkId : (srcServantId != null ? srcServantId : tarId),
+      src_servant_id: srcServantId != null ? srcServantId : tarId,
+      tar_servant_ids: [tarId],
+      src_type: 3,
+      src_id: 60120,
+      id: 60120,
+      effect_phase: phase,
+      change_type: 300020,
+      change_value: [buffId],
+      remove_round: 0,
+    });
+  }
+}
 // 客户端的特性演出完全由一个配置字段驱动：FightFeature[effect.id].act
 //   act(技能id) → Skill[act].fightAct[] → FightAct[].effs[] → EffectMgr.showSpine
 // 没有 act 的展示条目（23090/23100/23110/23120 都是）只会弹横幅，永远不播动画；
@@ -1716,6 +1768,18 @@ function checkEntranceTalents(units, battleState, currentRound) {
         change_type: 300019, change_value: [encodeBuffVal(232200, 1)], remove_round: 2,
       });
     }
+    // 雅典娜（21530 战争神盾）：进场同步初始 2 层圣盾图标（CfgBuff[21530] TalentSkillIcom02）
+    if (u.talent === 21530 && !u.athenaInitBuffDone) {
+      u.athenaInitBuffDone = true;
+      if (u.athenaShields == null) u.athenaShields = 2;
+      pushStackBuffEffect(effects, { buffId: 21530, stacks: u.athenaShields, tarId: u.id, srcId: 21530, srcServantId: u.id, atkId: u.id, phase: 1 });
+    }
+    // 犹格索托斯（21910 虚空掌控）：进场同步初始 50 虚空图标（CfgBuff[21910] TalentSkillIcom06）
+    if (u.talent === 21910 && !u.voidInitBuffDone) {
+      u.voidInitBuffDone = true;
+      if (u.void_energy == null) u.void_energy = 50;
+      pushStackBuffEffect(effects, { buffId: 21910, stacks: u.void_energy, tarId: u.id, srcId: 21910, srcServantId: u.id, atkId: u.id, phase: 1 });
+    }
 
     // 玉子烧（23120 软绵回忆）：战斗开始时相应角色随机两项能力提升1级
     if (u.talent === 23120 && !u.tamagoyakiEntranceDone) {
@@ -1763,7 +1827,7 @@ function checkEntranceTalents(units, battleState, currentRound) {
         if (victim.hp < victimHpBefore) {
           effects.push({
             trigger_count: 0, atk_servant_id: u.id, src_servant_id: u.id, tar_servant_ids: [victim.id],
-            src_type: 1, src_id: 20570, id: 20570, effect_phase: 1,
+            src_type: 1, src_id: 20570, id: 20571, effect_phase: 1, // FightFeature[20571] act=205701
             change_type: 200000, change_value: [-(victimHpBefore - victim.hp)], remove_round: 0,
           });
         }
@@ -2117,6 +2181,69 @@ function initUnitBattleState(unit) {
   unit.friggaNextBonus = unit.friggaNextBonus || 0;
   unit.xuanwuNextBonus = unit.xuanwuNextBonus || 0;
   unit.hitByTyr = unit.hitByTyr || false;
+}
+
+/**
+ * 多波转场（batch > 1）时重置存活我方单位的波内状态，对齐官服客户端 FightModule.onFightLoopEnd2
+ * 执行的三件事：revmoeAllBuff() + removeAllAdditionAttr() + removeAllSkillState()。
+ * 明确保留 hp/maxHp/shield、skills(含剩余pp)、attrs、element、talent/relic、永久词条及一次性开场标记。
+ */
+function resetUnitForNextWave(unit) {
+  if (!unit) return;
+  unit.statLevels = { 101: 0, 102: 0, 103: 0, 104: 0, 105: 0, 111: 0, 113: 0, 115: 0 };
+  unit.phy_atk_lv = unit.mag_atk_lv = unit.phy_def_lv = unit.mag_def_lv = 0;
+  unit.speed_lv = unit.crit_hit_lv = unit.hit_rate_lv = unit.dodge_rate_lv = 0;
+  unit.buffs = {};
+  // 仅清除回合制技能赋予的暴击免疫，不覆盖圣器带来的永久 immuneCrit
+  if ((unit.immuneCritRounds || 0) > 0 || unit.holyBless) unit.immuneCrit = false;
+  unit.holyBless = false;
+  // 清零全部单位级 *Rounds 回合计时器（不触碰嵌套的 unit.element.rounds）
+  for (const k of Object.keys(unit)) {
+    if (k.endsWith('Rounds') && typeof unit[k] === 'number') unit[k] = 0;
+  }
+  unit.tauntedBy = null;
+  unit.gazeSkillId = null;
+  unit.flinch = false;
+  unit.pendingFaint = false;
+  unit.petrified = false;
+  unit.shadow_bind = 0;
+  unit.curseOfDead = 0;
+  unit.midgardPoison = false;
+  unit.yellowSign = false;
+  unit.forsetiCodexActive = false;
+  unit.bloodStainStacks = 0;
+  unit.windWalkerMarkedBy = null;
+  unit.soundVulnRatio = 0;
+  unit.kotoriFireVuln = 0;
+  unit.roundEndStat = null;
+  unit.roundEndAllyRandom = 0;
+  unit.roundEndRandomDebuff = 0;
+  unit.asmodeusDmgDownNextRound = false;
+  unit.delayedStrike = null;
+  unit.firstHitTo1 = false;
+  unit.skipNextAction = false;
+  unit.nextOutDmgDown = 0;
+  unit.nextOutDmgUp = 0;
+  unit.nextDmgBonus = 0;
+  unit.currDmgBonus = 0;
+  unit.waterDmgBoostNextRound = 0;
+  unit.demeterNextDmg = 0;
+  unit.demeterCurrDmg = 0;
+  unit.osirisNextDmg = 0;
+  unit.osirisCurrDmg = 0;
+  unit.friggaNextBonus = 0;
+  unit.xuanwuNextBonus = 0;
+  unit.fubukiDmgBoost = 0;
+  unit.animalRepelOwner = null;
+  unit.nightNoDrop = false;
+  unit.judgmentPermanent = false;
+  unit.actedThisRound = false;
+  unit.hitThisRound = false;
+  unit.hitByServants = [];
+  unit.hitsTakenThisRound = 0;
+  unit.strangledThisRound = false;
+  unit.gatanoHitThisRound = false;
+  unit.hitByTyr = false;
 }
 
 
@@ -3150,6 +3277,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       const vbKeep = (battleState && battleState.isDream) ? (Number(vbRule.voidBurst.dreamKeepRatio) || 0) : 0;
       actor.void_energy = Math.floor(actor.voidBurstSnapshot * vbKeep);
       actor.voidFullFired = false;   // 倾泻后允许重新"充满"
+      pushStackBuffEffect(wakeEffects, { buffId: 21910, stacks: actor.void_energy, tarId: actor.id, srcId: 21910, srcServantId: actor.id, atkId: actor.id, phase });
     } else {
       actor.voidBurstSnapshot = null;
     }
@@ -3377,7 +3505,10 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
 
   // 神楽Mea & Meu（22810 & 22820）：全场任意誓灵使用技能叠财布
   (allUnits || []).filter(u => u && u.hp > 0 && (u.talent === 22810 || u.talent === 22820)).forEach(u => {
-    u.walletLayers = (u.walletLayers || 0) + 1;
+    u.walletLayers = Math.min(200, (u.walletLayers || 0) + 1);
+    if (u.talent === 22810) {
+      pushStackBuffEffect(wakeEffects, { buffId: 22810, stacks: u.walletLayers, tarId: u.id, srcId: 22810, srcServantId: u.id, atkId: actor.id, phase });
+    }
   });
 
   // 复合攻击技统计：本次行动实际造成的总伤害（含护盾吸收）与被伤害目标，
@@ -3901,6 +4032,11 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       rel = 0;
     }
 
+    // 10241 冰之结界：处于冰之结界时，四糸乃（21690 隐居者）不会受到克制伤害
+    if (t.talent === 21690 && rel === 1 && battleState && battleState.allyFields && battleState.allyFields[t.side] && battleState.allyFields[t.side].iceBarrier && battleState.allyFields[t.side].iceBarrier.rounds > 0) {
+      rel = 0;
+    }
+
     // 正体不明（21410 鵺）：不会被克制（weekPer/awk/extra 位/元素克制乘区全走 rel，改 rel 一处全生效）
     if (t.talent === 21410 && rel === 1) {
       rel = 0;
@@ -4276,7 +4412,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
 
     // 26. 维德佛尔尼尔（20740 智慧的注视者）：己方风属性誓灵攻击时伤害提升己方能力总等级*10%（最高100%）
     let vedrfolnirMul = 1.0;
-    if (cfg.nature === 3 || actor.nature === 3) {
+    if ((actor.nature || natureOf(actor.type)) === 3) {
       const hasVedr = (allUnits || []).some(u => u && u.hp > 0 && u.side === actor.side && u.talent === 20740);
       if (hasVedr) {
         let allyPosStages = 0;
@@ -4429,6 +4565,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     if (actor.talent === 22810 && (actor.walletLayers || 0) > 0) {
       const wLayers = actor.walletLayers;
       actor.walletLayers = 0;
+      pushStackBuffEffect(wakeEffects, { buffId: 22810, stacks: 0, tarId: actor.id, srcId: 22810, srcServantId: actor.id, atkId: actor.id, phase });
       meaMul = 1.0 + (wLayers * 0.20);
       const props = [101, 102, 103, 104, 105, 111, 113, 115];
       for (let i = 0; i < wLayers; i++) {
@@ -4661,6 +4798,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         t.leoFurStacks--;
         leoMit = 0.20;
         gainStat(t, 102, 1, { effects: wakeEffects, srcId: 21110, atkId: actor.id, srcServantId: t.id, phase });
+        pushStackBuffEffect(wakeEffects, { buffId: 21110, stacks: t.leoFurStacks, tarId: t.id, srcId: 21110, srcServantId: t.id, atkId: actor.id, phase });
       }
     // 105. 未（22060 日斜）：在场时己方誓灵生命回复量提升50%
     let weiHealBonus = ((allUnits || []).some(x => x && x.hp > 0 && x.side === t.side && x.talent === 22060)) ? 0.50 : 0;
@@ -5019,6 +5157,30 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       // 近似口径 =「目标本回合已行动」（actedThisRound）。6 条技共用 dmgMulVsActed。
       if (skillRule && skillRule.dmgMulVsActed && t.actedThisRound) {
         exclusiveOutInMul *= skillRule.dmgMulVsActed;
+      }
+      // 七之弹（10236）：攻击本回合未行动目标伤害提升 25%
+      if (skillRule && skillRule.dmgMulVsUnacted && !t.actedThisRound) {
+        exclusiveOutInMul *= skillRule.dmgMulVsUnacted;
+      }
+      // 淬火（10430）：对自己造成最大生命 20% 伤害，使本次技能伤害提高 20%
+      if (skillRule && skillRule.quenchFire && skillRule.quenchFire.dmgMul) {
+        exclusiveOutInMul *= skillRule.quenchFire.dmgMul;
+      }
+      // 灼炎再生（10237）：使用者下次使用火属性技能伤害提升 35%
+      if (cfg.nature === 2 && cfg.power > 0 && (actor.nextFireDmgPct || 0) > 0) {
+        exclusiveOutInMul *= 1 + Number(actor.nextFireDmgPct) / 100;
+      }
+      // 永结冰霜（10242）：对方场上誓灵速度等级总和 < 0 时，每负一级提升 10% 技能伤害
+      if (skillRule && skillRule.dmgMulPerEnemyNegSpd) {
+        const spdSum = (allUnits || [])
+          .filter(u => u && u.hp > 0 && u.side !== actor.side)
+          .reduce((acc, u) => acc + Number((u.statLevels && u.statLevels[105]) || 0), 0);
+        if (spdSum < 0) exclusiveOutInMul *= 1 + (-spdSum) * Number(skillRule.dmgMulPerEnemyNegSpd);
+      }
+      // 最后之剑（10254）：额外提升（目标已损失生命/目标最大生命）* 100% 伤害
+      if (skillRule && skillRule.dmgMulByTargetMissingHp) {
+        const missRatio = Math.max(0, 1 - (t.hp / Math.max(1, t.maxHp || 1)));
+        exclusiveOutInMul *= 1 + missRatio * Number(skillRule.dmgMulByTargetMissingHp);
       }
       // 疾走之风/其他「按速度差增伤」：风神破-疾（10049）速度越高威力越高（每点速度差 +1%，上限 +50%）
       if (skillRule && skillRule.dmgMulBySpeedDiff) {
@@ -5578,7 +5740,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         tar_servant_ids: [t.id],
         src_type: 1,
         src_id: 21390,
-        id: 21390,
+        id: 21391, // FightFeature[21391] act=20500
         effect_phase: phase,
         change_type: 200000,
         change_value: [-extra],
@@ -5598,7 +5760,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         tar_servant_ids: [actor.id],
         src_type: 1,
         src_id: 21400,
-        id: 21400,
+        id: 21401, // FightFeature[21401] act=20501
         effect_phase: phase,
         change_type: 200000,
         change_value: [-ret],
@@ -5627,6 +5789,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     // 60. 八上比卖（22620 侧室的幽怨）：对目标造成伤害时叠加1层“哀叹”
     if (actor.talent === 22620 && hurt > 0) {
       t.lamentStacks = (t.lamentStacks || 0) + 1;
+      pushStackBuffEffect(wakeEffects, { buffId: 22620, stacks: Math.min(10, t.lamentStacks), tarId: t.id, srcId: 22620, srcServantId: actor.id, atkId: actor.id, phase });
     }
 
     // 47. 诗寇蒂（20860 命运·未来）：记录本回合自身造成的伤害供下回合末爆发
@@ -5749,26 +5912,9 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         t.statLevels = t.statLevels || {};
         // 三维+1 必须逐项发 100000 属性 effect（id=20001/20003/20004，客户端表内、
         // tips="#tar的物攻/物防/魔防上升了#value级"）——只改数值不发 effect 玩家看不到任何反馈，
-        // 观感即「被动没用」（2026-10-12 用户反馈实证）
+        // 观感即「被动没用」（2026-10-12 用户反馈实证）；经 gainStat 统一钳制与去零
         [101, 103, 104].forEach(p => {
-          const oldLv = t.statLevels[p] || 0;
-          const newLv = Math.min(6, oldLv + 1);
-          t.statLevels[p] = newLv;
-          const an = PROP_ATTR_NAMES[p];
-          if (an) t[an] = newLv;
-          wakeEffects.push({
-            trigger_count: 0,
-            atk_servant_id: actor.id, // 修复：客户端按 curEffData.atk_id 查桶，必须是攻击者（原 t.id）
-            src_servant_id: t.id,
-            tar_servant_ids: [t.id],
-            src_type: 1,
-            src_id: 20870,
-            id: PROP_FEATURE_IDS[p] || 20001,
-            effect_phase: phase,
-            change_type: 100000, // FIGHT_EFF_CHANGE_TYPE_ATTR
-            change_value: [encodeAttrVal(p, 1)],
-            remove_round: 0,
-          });
+          gainStat(t, p, 1, { effects: wakeEffects, srcId: 20870, atkId: actor.id, srcServantId: t.id, phase });
         });
         const heal = Math.max(1, Math.round(t.maxHp * 0.10));
         t.hp = Math.min(t.maxHp, t.hp + heal);
@@ -5830,7 +5976,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         tar_servant_ids: [actor.id],
         src_type: 1,
         src_id: 20840,
-        id: 20840,
+        id: 20841, // FightFeature[20841] act=20015
         effect_phase: phase,
         change_type: 200000,
         change_value: [heal],
@@ -5854,7 +6000,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
           tar_servant_ids: [cap.id],
           src_type: 1,
           src_id: 21040,
-          id: 21040,
+          id: 210401, // FightFeature[210401] act=20658
           effect_phase: phase,
           change_type: 200000,
           change_value: [-share],
@@ -5873,23 +6019,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       const natToProp = { 1: 104, 2: 101, 3: 105, 4: 103, 5: 102, 6: 111 };
       const prop = natToProp[actor.nature];
       if (prop) {
-        t.statLevels = t.statLevels || {};
-        t.statLevels[prop] = Math.min(6, (t.statLevels[prop] || 0) + 2);
-        const an = PROP_ATTR_NAMES[prop];
-        if (an) t[an] = t.statLevels[prop];
-        wakeEffects.push({
-          trigger_count: 0,
-          atk_servant_id: actor.id,
-          src_servant_id: t.id,
-          tar_servant_ids: [t.id],
-          src_type: 1,
-          src_id: 21850,
-          id: 21850,
-          effect_phase: phase,
-          change_type: 100000,
-          change_value: [encodeAttrVal(prop, 2, t.statLevels[prop])],
-          remove_round: 0,
-        });
+        gainStat(t, prop, 2, { effects: wakeEffects, srcId: 21850, atkId: actor.id, srcServantId: t.id, phase });
       }
     }
 
@@ -5939,7 +6069,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         tar_servant_ids: [t.id],
         src_type: 1,
         src_id: 22100,
-        id: 22100,
+        id: 22101, // FightFeature[22101] act=20505
         effect_phase: phase,
         change_type: 200000,
         change_value: [heal],
@@ -5995,13 +6125,17 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     }
 
     // 122. 阿修罗（22720 阿修罗道）：每失去1%生命获得2战意（上限200）
+    let asuraWillChanged = false;
     if (t.talent === 22720 && hurt > 0) {
       const pct = Math.max(1, Math.round((hurt / t.maxHp) * 100));
-      t.asuraWill = Math.min(200, (t.asuraWill || 0) + (pct * 2));
+      const beforeW = t.asuraWill || 0;
+      t.asuraWill = Math.min(200, beforeW + (pct * 2));
+      if (t.asuraWill !== beforeW) asuraWillChanged = true;
     }
     // 阿修罗：受到伤害时消耗50战意恢复15%生命
     if (t.talent === 22720 && hurt > 0 && (t.asuraWill || 0) >= 50) {
       t.asuraWill -= 50;
+      asuraWillChanged = true;
       const heal = Math.max(1, Math.round(t.maxHp * 0.15));
       const after = Math.min(t.maxHp, t.hp + heal);
       t.hp = after;
@@ -6018,6 +6152,9 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         change_value: [heal],
         remove_round: 0,
       });
+    }
+    if (asuraWillChanged && t.hp > 0) {
+      pushStackBuffEffect(wakeEffects, { buffId: 22720, stacks: t.asuraWill, tarId: t.id, srcId: 22720, srcServantId: t.id, atkId: actor.id, phase });
     }
 
     // 125. 凯布利（22850 圣甲虫之秘）：失去生命后己方全体下次攻击提升失血百分比75%增伤与吸血
@@ -6060,22 +6197,8 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       if (posKeys.length > 0) {
         const bestKey = posKeys.sort((a, b) => t.statLevels[b] - t.statLevels[a])[0];
         const p = Number(bestKey);
-        t.statLevels[p] = Math.max(-6, t.statLevels[p] - 1);
-        actor.statLevels = actor.statLevels || {};
-        actor.statLevels[p] = Math.min(6, (actor.statLevels[p] || 0) + 1);
-        wakeEffects.push({
-          trigger_count: 0,
-          atk_servant_id: actor.id,
-          src_servant_id: actor.id,
-          tar_servant_ids: [t.id],
-          src_type: 1,
-          src_id: 22200,
-          id: 22200,
-          effect_phase: phase,
-          change_type: 100000,
-          change_value: [encodeAttrVal(p, -1, t.statLevels[p])],
-          remove_round: 0,
-        });
+        gainStat(t, p, -1, { effects: wakeEffects, srcId: 22200, atkId: actor.id, srcServantId: actor.id, phase });
+        gainStat(actor, p, 1, { effects: wakeEffects, srcId: 22200, atkId: actor.id, srcServantId: actor.id, phase });
       }
     }
 
@@ -6086,28 +6209,30 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         const pk = nonZero[Math.floor(Math.random() * nonZero.length)];
         const p = Number(pk);
         const lv = t.statLevels[p] || 0;
-        actor.statLevels = actor.statLevels || {};
+        const newTargetLv = lv < 0 ? 0 : Math.max(0, lv - 3);
+        const tDelta = newTargetLv - lv;
+        t.statLevels[p] = newTargetLv;
+        const tAn = PROP_ATTR_NAMES[p];
+        if (tAn) t[tAn] = newTargetLv;
+        if (tDelta !== 0) {
+          wakeEffects.push({
+            trigger_count: 0,
+            atk_servant_id: actor.id,
+            src_servant_id: actor.id,
+            tar_servant_ids: [t.id],
+            src_type: 1,
+            src_id: 22660,
+            id: PROP_FEATURE_IDS[p] || 20001,
+            effect_phase: phase,
+            change_type: 100000,
+            change_value: [encodeAttrVal(p, tDelta)],
+            remove_round: 0,
+          });
+        }
         if (lv < 0) {
           // 负向：清除且自身提升相同类型和级数
-          actor.statLevels[p] = Math.min(6, (actor.statLevels[p] || 0) + (-lv));
-          t.statLevels[p] = 0;
-        } else {
-          // 正向：下降3级，最多降至0
-          t.statLevels[p] = Math.max(0, lv - 3);
+          gainStat(actor, p, -lv, { effects: wakeEffects, srcId: 22660, atkId: actor.id, srcServantId: actor.id, phase });
         }
-        wakeEffects.push({
-          trigger_count: 0,
-          atk_servant_id: actor.id,
-          src_servant_id: actor.id,
-          tar_servant_ids: [t.id],
-          src_type: 1,
-          src_id: 22660,
-          id: 22660,
-          effect_phase: phase,
-          change_type: 100000,
-          change_value: [encodeAttrVal(p, t.statLevels[p] - lv, t.statLevels[p])],
-          remove_round: 0,
-        });
       }
     }
 
@@ -6137,45 +6262,14 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       actor.quartetStolen = true;
       const props = [101, 102, 103, 104, 105];
       const p = props[Math.floor(Math.random() * props.length)];
-      t.statLevels[p] = Math.max(-6, (t.statLevels[p] || 0) - 1);
-      actor.statLevels = actor.statLevels || {};
-      const gOld = Number(actor.statLevels[p]) || 0;
-      const gNew = Math.min(6, gOld + 1);
-      const gDelta = gNew - gOld;
-      actor.statLevels[p] = gNew;
-      const gName = PROP_ATTR_NAMES[p];
-      if (gName) actor[gName] = gNew;
-      wakeEffects.push({
-        trigger_count: 0,
-        atk_servant_id: actor.id,
-        src_servant_id: actor.id,
-        tar_servant_ids: [t.id],
-        src_type: 1,
-        src_id: 23030,
-        id: 23030,
-        effect_phase: phase,
-        change_type: 100000,
-        change_value: [encodeAttrVal(p, -1, t.statLevels[p])],
-        remove_round: 0,
-      });
-      if (gDelta > 0) wakeEffects.push({
-        trigger_count: 0,
-        atk_servant_id: actor.id,
-        src_servant_id: actor.id,
-        tar_servant_ids: [actor.id],
-        src_type: 1,
-        src_id: 23030,
-        id: PROP_FEATURE_IDS[p] || 20001,
-        effect_phase: phase,
-        change_type: 100000,
-        change_value: [encodeAttrVal(p, gDelta, gNew)],
-        remove_round: 0,
-      });
+      gainStat(t, p, -1, { effects: wakeEffects, srcId: 23030, atkId: actor.id, srcServantId: actor.id, phase });
+      gainStat(actor, p, 1, { effects: wakeEffects, srcId: 23030, atkId: actor.id, srcServantId: actor.id, phase });
     }
 
     // 119. 伊斯（22580 电浆枪）：每次成功造成伤害累计1点电浆能量（上限5）
     if (actor.talent === 22580 && hurt > 0) {
       actor.plasmaEnergy = Math.min(5, (actor.plasmaEnergy || 0) + 1);
+      pushStackBuffEffect(wakeEffects, { buffId: 22580, stacks: actor.plasmaEnergy, tarId: actor.id, srcId: 22580, srcServantId: actor.id, atkId: actor.id, phase });
     }
     // 126. 鹿蜀（22940 音之回踏）：声音技能对目标造成伤害时，十字相邻敌方下次受伤+20%
     if (actor.talent === 22940 && hurt > 0) {
@@ -6298,7 +6392,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         actor.hp = Math.max(0, actor.hp - back);
         wakeEffects.push({
           trigger_count: 0, atk_servant_id: actor.id, src_servant_id: t.id, tar_servant_ids: [actor.id],
-          src_type: 1, src_id: 22250, id: 22250, effect_phase: phase,
+          src_type: 1, src_id: 22250, id: 22251, effect_phase: phase, // FightFeature[22251] act=20661
           change_type: 200000, change_value: [-back], remove_round: 0,
         });
       }
@@ -6316,7 +6410,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
           l.hp = Math.min(l.maxHp, l.hp + heal);
           wakeEffects.push({
             trigger_count: 0, atk_servant_id: actor.id, src_servant_id: l.id, tar_servant_ids: [l.id],
-            src_type: 1, src_id: 20100, id: 20100, effect_phase: phase,
+            src_type: 1, src_id: 20100, id: 20101, effect_phase: phase, // FightFeature[20101] act=20015
             change_type: 200000, change_value: [heal], remove_round: 0,
           });
         }
@@ -6395,11 +6489,15 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     // 76. 赫拉克勒斯（21550 十二功绩）：自身使用技能或受到技能攻击后增加1次功绩
     if (hurt > 0 && t && t.talent === 21550) {
       t.heraclesFeats = Math.min(12, (t.heraclesFeats || 0) + 1);
-        if (t.heraclesFeats >= 12) {
+      if (t.hp > 0) {
+        pushStackBuffEffect(wakeEffects, { buffId: 21550, stacks: t.heraclesFeats, tarId: t.id, srcId: 21550, srcServantId: t.id, atkId: actor.id, phase });
+        if (t.heraclesFeats >= 12 && !t.heraclesMaxFired) {
+          t.heraclesMaxFired = true;
           [101, 105].forEach(p => {
             gainStat(t, p, 2, { effects: wakeEffects, srcId: 21550, atkId: t.id, srcServantId: t.id, phase });
           });
         }
+      }
     }
 
     // 69. 兀尔德（20840 命运·过去）：记录本次所受伤害总额
@@ -6427,6 +6525,12 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     if ((hurt > 0 || shieldHurt > 0) && (t.kingsGuardRounds || 0) > 0) {
       const kgProp = (t.attrs && t.attrs.phy_atk >= t.attrs.mag_atk) ? 101 : 102;
       gainStat(t, kgProp, 1, { effects: wakeEffects, srcId: 10253, srcType: 3, atkId: t.id, srcServantId: t.id, phase });
+    }
+    // 10241 冰之结界：己方受到技能伤害时，使攻击者速度下降 1 级
+    if ((hurt > 0 || shieldHurt > 0) && actor.hp > 0 && actor.side !== t.side
+        && battleState && battleState.allyFields && battleState.allyFields[t.side]
+        && battleState.allyFields[t.side].iceBarrier && battleState.allyFields[t.side].iceBarrier.rounds > 0) {
+      gainStat(actor, 105, -1, { effects: wakeEffects, srcId: 10241, srcType: 3, atkId: actor.id, srcServantId: t.id, phase });
     }
     // 记录目标受击者历史（供夏色祭友情的力量判定）
     if (hurt > 0) {
@@ -6686,7 +6790,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     // 五河琴里（21660 炎魔）：打火系物攻+1且回血10%；打非火物防-1且下次受火伤+25%
     if (actor.talent === 21660 && (hurt > 0 || shieldHurt > 0) && t.hp > 0) {
       if (t.nature === 2) {
-        const atkDelta = gainStat(actor, 101, 1, { effects: wakeEffects, srcId: 21660, atkId: actor.id, srcServantId: actor.id, phase });
+        gainStat(actor, 101, 1, { effects: wakeEffects, srcId: 21660, atkId: actor.id, srcServantId: actor.id, phase });
         const healAmt = Math.min(actor.maxHp - actor.hp, Math.round(actor.maxHp * 0.10));
         if (healAmt > 0) {
           actor.hp += healAmt;
@@ -6697,20 +6801,6 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
             change_type: 200000, change_value: [healAmt], remove_round: 0,
           });
         }
-        // 满级时不再宣称"+1"（写死 delta=1 会弹一条数字与结果不符的飘字）
-        if (atkDelta > 0) wakeEffects.push({
-          trigger_count: 0,
-          atk_servant_id: actor.id,
-          src_servant_id: actor.id,
-          tar_servant_ids: [actor.id],
-          src_type: 1,
-          src_id: 21660,
-          id: 21660,
-          effect_phase: phase,
-          change_type: 100000,
-          change_value: [encodeAttrVal(101, atkDelta)],
-          remove_round: 0,
-        });
       } else {
         t.statLevels = t.statLevels || {};
         const oldDef = Number(t.statLevels[103]) || 0;
@@ -6737,7 +6827,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
 
     // 夜刀神十香（21680 公主）：若攻击物防被自身降低的目标，物攻+1且回复15%生命值
     if (actor.talent === 21680 && t.tohkaTargeted && (hurt > 0 || shieldHurt > 0) && t.hp > 0) {
-      const atkDelta = gainStat(actor, 101, 1, { effects: wakeEffects, srcId: 21680, atkId: actor.id, srcServantId: actor.id, phase });
+      gainStat(actor, 101, 1, { effects: wakeEffects, srcId: 21680, atkId: actor.id, srcServantId: actor.id, phase });
       // 官方：回复“该次伤害”的 15%（不是最大生命 15%）
       const dealtForHeal = Math.max(0, Math.round(hurt) + Math.round(shieldHurt || 0));
       const healAmt = Math.min(actor.maxHp - actor.hp, Math.round(dealtForHeal * 0.15));
@@ -6750,19 +6840,6 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
           change_type: 200000, change_value: [healAmt], remove_round: 0,
         });
       }
-      if (atkDelta > 0) wakeEffects.push({
-        trigger_count: 0,
-        atk_servant_id: actor.id,
-        src_servant_id: actor.id,
-        tar_servant_ids: [actor.id],
-        src_type: 1,
-        src_id: 21680,
-        id: 21680,
-        effect_phase: phase,
-        change_type: 100000,
-        change_value: [encodeAttrVal(101, atkDelta)],
-        remove_round: 0,
-      });
     }
 
     // 湊阿库娅（21960 无敌的剑圣）：使用物理技能攻击时扣除自身15%最大生命值并使己方全体魔攻提升1级
@@ -6788,7 +6865,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         tar_servant_ids: [actor.id],
         src_type: 1,
         src_id: 21960,
-        id: 21960,
+        id: 21961, // FightFeature[21961] act=20655
         effect_phase: phase,
         change_type: 200000,
         change_value: [-selfCost],
@@ -6972,19 +7049,8 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       if (t.athenaShields > 0) {
         t.athenaShields -= 1;
         t.athenaDmgBoostNext = (t.athenaDmgBoostNext || 0) + 0.50;
-        wakeEffects.push({
-          trigger_count: 0,
-          atk_servant_id: actor.id,
-          src_servant_id: t.id,
-          tar_servant_ids: [t.id],
-          src_type: 1,
-          src_id: 21530,
-          id: 21530,
-          effect_phase: phase,
-          change_type: 0,
-          change_value: [t.athenaShields],
-          remove_round: 0,
-        });
+        // 原 change_type:0 + 裸计数客户端零消费 → 同步 CfgBuff[21530] 图标（0 层时 300020 摘除）
+        pushStackBuffEffect(wakeEffects, { buffId: 21530, stacks: t.athenaShields, tarId: t.id, srcId: 21530, srcServantId: t.id, atkId: actor.id, phase, showBanner: true });
       }
     }
 
@@ -7071,6 +7137,9 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     if (actor.talent === 22260 && (hurt > 0 || shieldHurt > 0) && t.hp > 0) {
       t.godBlessingLayers = Math.min(9, (t.godBlessingLayers || 0) + 2);
     }
+    if ((t.godBlessingLayers || 0) !== prevBlessingLayers && t.hp > 0) {
+      pushStackBuffEffect(wakeEffects, { buffId: 22260, stacks: t.godBlessingLayers || 0, tarId: t.id, srcId: 22260, srcServantId: actor.id, atkId: actor.id, phase });
+    }
 
     // 大国主（22600 出云之魂）：每回合第一次受到伤害时，其余己方誓灵获得相同数值护盾
     // 2026-10-27：原先只改 ally.shield（处女座同型），补逐人 200001 让护盾条可见
@@ -7125,22 +7194,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
 
     // 努阿达（20720 银臂军神）：拳系技能造成克制伤害后50%几率物攻+1
     if (actor.talent === 20720 && isPunchSkill(cfg.id) && rel === 1 && (hurt > 0 || shieldHurt > 0) && rnd() < 0.50) {
-      const delta = gainStat(actor, 101, 1, { effects: wakeEffects, srcId: 20720, atkId: actor.id, srcServantId: actor.id, phase });
-      if (delta > 0) {
-        wakeEffects.push({
-          trigger_count: 0,
-          atk_servant_id: actor.id,
-          src_servant_id: actor.id,
-          tar_servant_ids: [actor.id],
-          src_type: 1,
-          src_id: 20720,
-          id: PROP_FEATURE_IDS[101],
-          effect_phase: phase,
-          change_type: 100000,
-          change_value: [encodeAttrVal(101, delta, (actor.statLevels && actor.statLevels[101]) || 0)],
-          remove_round: 0,
-        });
-      }
+      gainStat(actor, 101, 1, { effects: wakeEffects, srcId: 20720, atkId: actor.id, srcServantId: actor.id, phase });
     }
 
     // 亚巴顿（21740 亡之散布者）：击倒敌方誓灵时，将其负面能力等级转移给敌方随机一名存活誓灵
@@ -7156,28 +7210,8 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         const enemyAllies = (allUnits || []).filter(u => u && u.hp > 0 && u.side === t.side && u.id !== t.id);
         if (enemyAllies.length > 0) {
           const recipient = enemyAllies[Math.floor(rnd() * enemyAllies.length)];
-          recipient.statLevels = recipient.statLevels || {};
-          const encoded = [];
           negChanges.forEach(nc => {
-            const oldLv = recipient.statLevels[nc.prop] || 0;
-            const newLv = Math.max(-6, oldLv + nc.stage);
-            recipient.statLevels[nc.prop] = newLv;
-            const an = PROP_ATTR_NAMES[nc.prop];
-            if (an) recipient[an] = newLv;
-            encoded.push(encodeAttrVal(nc.prop, nc.stage, newLv));
-          });
-          wakeEffects.push({
-            trigger_count: 0,
-            atk_servant_id: actor.id,
-            src_servant_id: actor.id,
-            tar_servant_ids: [recipient.id],
-            src_type: 1,
-            src_id: 21740,
-            id: 21740,
-            effect_phase: phase,
-            change_type: 100000,
-            change_value: encoded,
-            remove_round: 0,
+            gainStat(recipient, nc.prop, nc.stage, { effects: wakeEffects, srcId: 21740, atkId: actor.id, srcServantId: actor.id, phase });
           });
         }
       }
@@ -7188,6 +7222,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     if (hurt > 0 || shieldHurt > 0) {
       (allUnits || []).filter(u => u && u.hp > 0 && u.talent === 23170).forEach(nemain => {
         nemain.nemainBlood = Math.min(15, (nemain.nemainBlood || 0) + 1);
+        pushStackBuffEffect(wakeEffects, { buffId: 23170, stacks: nemain.nemainBlood, tarId: nemain.id, srcId: 23170, srcServantId: nemain.id, atkId: actor.id, phase });
       });
     }
 
@@ -7227,14 +7262,11 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
 
     // 兰斯洛特（23010 湖夜祈祷）：受到抵抗伤害提升较高攻击与速度各1级
     if (rel === 2 && (hurt > 0 || shieldHurt > 0)) {
-      const hasLancelot = (allUnits || []).some(u => u && u.hp > 0 && u.side === t.side && u.talent === 23010);
-      if (hasLancelot) {
+      const lancelot = (allUnits || []).find(u => u && u.hp > 0 && u.side === t.side && u.talent === 23010);
+      if (lancelot) {
         const atkP = ((t.attrs && t.attrs.phy_atk) >= (t.attrs && t.attrs.mag_atk)) ? 101 : 102;
-        t.statLevels = t.statLevels || {};
         [atkP, 105].forEach(p => {
-          t.statLevels[p] = Math.min(6, (t.statLevels[p] || 0) + 1);
-          const an = PROP_ATTR_NAMES[p];
-          if (an) t[an] = t.statLevels[p];
+          gainStat(t, p, 1, { effects: wakeEffects, srcId: 23010, atkId: actor.id, srcServantId: lancelot.id, phase });
         });
       }
     }
@@ -7368,17 +7400,20 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     if (actor.talent === 23170 && (hurt > 0 || shieldHurt > 0) && (actor.nemainBlood || 0) > 0) {
       const blood = actor.nemainBlood;
       actor.nemainBlood = 0;
+      pushStackBuffEffect(wakeEffects, { buffId: 23170, stacks: 0, tarId: actor.id, srcId: 23170, srcServantId: actor.id, atkId: actor.id, phase });
       const foes = (allUnits || []).filter(u => u && u.hp > 0 && u.side !== actor.side);
       if (foes.length > 0) {
         const perFoe = Math.max(1, Math.floor(blood / foes.length));
         foes.forEach(f => {
           f.nemainBloodFoe = (f.nemainBloodFoe || 0) + perFoe;
-            while (f.nemainBloodFoe >= 5) {
-              f.nemainBloodFoe -= 5;
-              [101, 102, 103, 104, 105, 111, 113, 115].forEach(p => {
-                gainStat(f, p, -1, { effects: wakeEffects, srcId: 23170, atkId: actor.id, srcServantId: actor.id, phase });
-              });
-            }
+          while (f.nemainBloodFoe >= 5) {
+            f.nemainBloodFoe -= 5;
+            [101, 102, 103, 104, 105, 111, 113, 115].forEach(p => {
+              gainStat(f, p, -1, { effects: wakeEffects, srcId: 23170, atkId: actor.id, srcServantId: actor.id, phase });
+            });
+          }
+          // CfgBuff[23171] 敌方血污层数图标同步（0 层时 300020 摘除）
+          pushStackBuffEffect(wakeEffects, { buffId: 23171, stacks: f.nemainBloodFoe, tarId: f.id, srcId: 23170, srcServantId: actor.id, atkId: actor.id, phase });
         });
       }
     }
@@ -7518,21 +7553,9 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     // 甘狄拔（18001004）：击倒敌方后随机一项攻击提升 1 级（物攻/魔攻各半，取较高者更贴近"攻击"语义）
     if (after <= 0 && t.hp > 0 && actor.relicMisc && actor.relicMisc.onKillRandomAtk && actor.hp > 0) {
       const atkProp = ((actor.attrs && actor.attrs.phy_atk) >= (actor.attrs && actor.attrs.mag_atk)) ? 101 : 102;
-      actor.statLevels = actor.statLevels || {};
-      const oLv = actor.statLevels[atkProp] || 0;
-      const nLv = Math.max(-6, Math.min(6, oLv + actor.relicMisc.onKillRandomAtk));
-      if (nLv !== oLv) {
-        actor.statLevels[atkProp] = nLv;
-        const an = PROP_ATTR_NAMES[atkProp];
-        if (an) actor[an] = nLv;
-        wakeEffects.push({
-          trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id,
-          tar_servant_ids: [actor.id], src_type: 1,
-          src_id: PROP_FEATURE_IDS[atkProp] || 20001, id: PROP_FEATURE_IDS[atkProp] || 20001,
-          effect_phase: phase, change_type: 100000,
-          change_value: [encodeAttrVal(atkProp, 1, nLv)], remove_round: 0,
-        });
-      }
+      gainStat(actor, atkProp, actor.relicMisc.onKillRandomAtk, {
+        effects: wakeEffects, srcId: PROP_FEATURE_IDS[atkProp] || 20001, atkId: actor.id, srcServantId: actor.id, phase,
+      });
     }
     if (skillRule && skillRule.postDamageRandomStat && Number(hurt) > 0) {
       gainStat(actor, [101, 102, 103, 104, 105][Math.floor(Math.random() * 5)], skillRule.postDamageRandomStat,
@@ -7551,7 +7574,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       t.hp = Math.max(0, t.hp - boom);
       wakeEffects.push({
         trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [t.id],
-        src_type: 1, src_id: 20790, id: 20790, effect_phase: phase,
+        src_type: 1, src_id: 20790, id: 20791, effect_phase: phase, // FightFeature[20791] act=20005
         change_type: 200000, change_value: [-boom], remove_round: 0,
       });
     }
@@ -7619,7 +7642,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       actor.hp = Math.min(actor.maxHp, actor.hp + drain);
       wakeEffects.push({
         trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
-        src_type: 1, src_id: 20680, id: 20680, effect_phase: phase,
+        src_type: 1, src_id: 20680, id: 20681, effect_phase: phase, // FightFeature[20681] act=20015
         change_type: 200000, change_value: [drain], remove_round: 0,
       });
     }
@@ -7709,6 +7732,7 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
       const pe = Number(actor.plasmaEnergy) || 0;
       if (pe > 0) {
         actor.plasmaEnergy = 0;
+        pushStackBuffEffect(wakeEffects, { buffId: 22580, stacks: 0, tarId: actor.id, srcId: 22580, srcServantId: actor.id, atkId: actor.id, phase });
         const extra = Math.max(1, Math.round(hurt * 0.25 * pe));
         t.hp = Math.max(0, t.hp - extra);
         results.push({ target: t.id, hurt: extra, final_hp: t.hp, shield_hurt: 0, final_shield: Math.max(0, t.shield || 0), extra: 0 });
@@ -7766,6 +7790,21 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
         src_type: 1, src_id: 10418, id: 10418, effect_phase: phase,
         change_type: 200000, change_value: [-extra], remove_round: 0,
       });
+    }
+    // 炽焰斩（10238）：造成伤害后，目标额外受到（使用者原始魔攻/使用者原始物攻）* 18% 最大HP 的伤害
+    if (skillRule && skillRule.blazingSlashRatioPct && (hurt > 0 || shieldHurt > 0) && t.hp > 0) {
+      const rawMag = Number((actor.attrs && actor.attrs.mag_atk) || actor.mag_atk || 1);
+      const rawPhy = Math.max(1, Number((actor.attrs && actor.attrs.phy_atk) || actor.phy_atk || 1));
+      const extra = Math.max(1, Math.round((rawMag / rawPhy) * (Number(skillRule.blazingSlashRatioPct) / 100) * (t.maxHp || 1)));
+      const before = t.hp;
+      t.hp = Math.max(0, t.hp - extra);
+      if (t.hp < before) {
+        wakeEffects.push({
+          trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [t.id],
+          src_type: 3, src_id: 10238, id: 122501, effect_phase: phase, // FightFeature[122501] act=20500
+          change_type: 200000, change_value: [-(before - t.hp)], remove_round: 0,
+        });
+      }
     }
     // 如影随形（10275）：造成伤害后留下风行者印记；此后对拥有该印记的目标额外造成 50% 伤害
     if (cfg.id === 10275 && hurt > 0 && t.hp > 0) {
@@ -7989,6 +8028,9 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
   actor.hwanungBuffDmg = 0;
   actor.friggaNextBonus = 0;
   actor.xuanwuNextBonus = 0;
+  if (cfg && cfg.nature === 2 && cfg.power > 0 && (actor.nextFireDmgPct || 0) > 0) {
+    actor.nextFireDmgPct = 0;
+  }
   actor.actedThisRound = true;
   if (isSoundSkill(cfg.id) && battleState) {
     battleState.soundUsedSide = battleState.soundUsedSide || {};
@@ -8036,14 +8078,56 @@ function settleSkill(actor, cfg, targets, allUnits, rng, actIndex, battleState) 
     }
     actor.dealtDamageThisRound = true;
   }
-  if (skillRule && skillRule.selfDamageThird && totalDealt > 0 && actor.hp > 0) {
-    const self = Math.max(1, Math.round(totalDealt / 3));
-    actor.hp = Math.max(0, actor.hp - self);
-    wakeEffects.push({
-      trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
-      src_type: 3, src_id: cfg.id, id: 60120, effect_phase: phase,
-      change_type: 200000, change_value: [-self], remove_round: 0,
-    });
+  if (skillRule && skillRule.selfDamageThird && results.length > 0 && actor.hp > 0 && curWeather !== WEATHER_IDS.LIGHT) {
+    // 10299 耀雨之光棘：按技能 1/3 威力（20）结合自身物攻/物防结算一次自伤，而非全敌输出 totalDealt/3
+    const isPhy = Number(cfg.type) !== 2;
+    const lv = Number(actor.level) || 1;
+    const atkProp = isPhy ? 101 : 102;
+    const defProp = isPhy ? 103 : 104;
+    const atkLv = (actor.statLevels && actor.statLevels[atkProp]) || 0;
+    const defLv = (actor.statLevels && actor.statLevels[defProp]) || 0;
+    const baseAtk = isPhy ? ((actor.attrs && actor.attrs.phy_atk) || 100) : ((actor.attrs && actor.attrs.mag_atk) || 100);
+    const baseDef = isPhy ? ((actor.attrs && actor.attrs.phy_def) || 100) : ((actor.attrs && actor.attrs.mag_def) || 100);
+    const atk = baseAtk * attrLvMul(atkLv);
+    const def = Math.max(1, baseDef * attrLvMul(defLv));
+    const selfPower = Math.max(1, (Number(cfg.power) || 60) / 3);
+    const self = Math.max(1, Math.round(((lv + 5) / 50) * selfPower * atk / def));
+    const before = actor.hp;
+    actor.hp = Math.max(0, before - self);
+    const actualLoss = before - actor.hp;
+    if (actualLoss > 0) {
+      wakeEffects.push({
+        trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
+        src_type: 3, src_id: cfg.id, id: 60120, effect_phase: phase,
+        change_type: 200000, change_value: [-actualLoss], remove_round: 0,
+      });
+    }
+  }
+  // 10430 淬火：对自己造成最大生命 20% 伤害；若因此生命归零且持有 23280 泣朱，同样触发天赋后半段（回满血 + 下次 +60% + 永久易伤 +60%）
+  if (skillRule && skillRule.quenchFire && actor.hp > 0) {
+    const qf = skillRule.quenchFire;
+    const maxHp = Number(actor.maxHp || (actor.attrs && actor.attrs.hp) || actor.hp) || 1;
+    const selfDmg = Math.max(1, Math.ceil(maxHp * (Number(qf.selfMaxHpPct) || 20) / 100));
+    if (actor.hp - selfDmg <= 0 && actor.talent === 23280) {
+      actor.hp = maxHp;
+      actor.zhuqueSelfBoost = 0.60;
+      actor.zhuqueVuln = (actor.zhuqueVuln || 0) + 0.60;
+      wakeEffects.push({
+        trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
+        src_type: 1, src_id: 23280, id: 232801, effect_phase: phase,
+        change_type: 200000, change_value: [maxHp], remove_round: 0,
+      });
+    } else {
+      const before = actor.hp;
+      actor.hp = Math.max(0, actor.hp - selfDmg);
+      if (actor.hp < before) {
+        wakeEffects.push({
+          trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
+          src_type: 3, src_id: cfg.id, id: 60120, effect_phase: phase,
+          change_type: 200000, change_value: [-(before - actor.hp)], remove_round: 0,
+        });
+      }
+    }
   }
   results.wakeEffects = wakeEffects;
   return results;
@@ -8261,17 +8345,41 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
       u.supportBanRounds = Math.max(u.supportBanRounds || 0, rule.supportBanBoth);
     });
   }
-  if (rule.selfHpCostPct) {
-    const costBefore = actor.hp;
-    actor.hp = Math.max(1, actor.hp - Math.max(1, Math.round((actor.maxHp || 1) * rule.selfHpCostPct / 100)));
-    // 自费 HP 必须下发（10115 恶魔的契约/10356 丰满的麦穗）——否则客户端血条停在旧值，
-    // 下一次绝对同步瞬跳（苏摩 23140 同族，2026-11-01）。60120=静默承载条目（D15 口径）。
-    if (actor.hp < costBefore) {
-      effects.push({
-        trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
-        src_type: 3, src_id: cfg.id, id: 60120, effect_phase: phase,
-        change_type: 200000, change_value: [-(costBefore - actor.hp)], remove_round: 0,
-      });
+  if (rule.selfHpCostPct && actor.hp > 0) {
+    const curW = Number(battleState && battleState.weather && battleState.weather.start_weather) || 0;
+    const weatherImmune = rule.selfHpCostWeatherImmune != null && curW === Number(rule.selfHpCostWeatherImmune);
+    if (!weatherImmune) {
+      const costBefore = actor.hp;
+      const baseHp = rule.selfHpCostBasis === 'current' ? actor.hp : (actor.maxHp || 1);
+      const minHp = rule.selfHpCostMinHp != null ? Number(rule.selfHpCostMinHp) : 1;
+      const loss = Math.max(1, Math.round(baseHp * rule.selfHpCostPct / 100));
+      actor.hp = Math.max(minHp, actor.hp - loss);
+      // 自费 HP 必须下发（10115 恶魔的契约/10356 丰满的麦穗/10236 七之弹/10217 星之陨）——否则客户端血条停在旧值，
+      // 下一次绝对同步瞬跳（苏摩 23140 同族，2026-11-01）。优先使用规则指定的官方 FightFeature 展示 id（如 12231 七之弹），否则 60120。
+      if (actor.hp < costBefore) {
+        effects.push({
+          trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [actor.id],
+          src_type: 3, src_id: cfg.id, id: rule.selfHpCostFeatureId || 60120, effect_phase: phase,
+          change_type: 200000, change_value: [-(costBefore - actor.hp)], remove_round: 0,
+        });
+      }
+    }
+  }
+  // 10295 迅捷复仇：随机扣除非自身的某一友方单位当前 35% 的生命（最低保留 1 HP）
+  if (rule.allyHpCostCurrentPct) {
+    const otherAllies = (allUnits || []).filter(u => u && u.hp > 0 && u.side === actor.side && u.id !== actor.id);
+    if (otherAllies.length > 0) {
+      const victim = otherAllies[Math.floor(rnd() * otherAllies.length)];
+      const before = victim.hp;
+      const loss = Math.max(1, Math.round(victim.hp * rule.allyHpCostCurrentPct / 100));
+      victim.hp = Math.max(1, victim.hp - loss);
+      if (victim.hp < before) {
+        effects.push({
+          trigger_count: 0, atk_servant_id: actor.id, src_servant_id: actor.id, tar_servant_ids: [victim.id],
+          src_type: 3, src_id: cfg.id, id: 60120, effect_phase: phase,
+          change_type: 200000, change_value: [-(before - victim.hp)], remove_round: 0,
+        });
+      }
     }
   }
   if (rule.animalRepel) {
@@ -8825,6 +8933,19 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
       dmgDownPct: Number(la.dmgDownPct) || 20,
     };
   }
+  if (rule.nextFireDmgPct && actor.hp > 0) {
+    // 10237 灼炎再生：使用者下次使用火属性技能伤害提升 35%
+    actor.nextFireDmgPct = Math.max(Number(actor.nextFireDmgPct) || 0, Number(rule.nextFireDmgPct));
+  }
+  if (rule.iceBarrier && battleState) {
+    // 10241 冰之结界：己方受到技能伤害时使攻击者速度下降 1 级；四糸乃（21690）不受克制伤害
+    const ib = rule.iceBarrier;
+    battleState.allyFields = battleState.allyFields || {};
+    battleState.allyFields[actor.side] = battleState.allyFields[actor.side] || {};
+    battleState.allyFields[actor.side].iceBarrier = {
+      rounds: Number(ib.rounds) || 3,
+    };
+  }
   if (rule.freeBreath) {
     // 10283 自由的呼吸：自损 15% 最大生命（保底 1），己方全体随机提升 1~2 级能力，HOLOLIVE 额外 +1
     const fb = rule.freeBreath;
@@ -9207,18 +9328,23 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
             .reduce((s2, p) => s2 + ((actor.statLevels && actor.statLevels[p]) || 0), 0);
           if (statLvSum < Number(b.requireStatSum)) return;
         }
+        // 解析随机异常池（10085 恶魔的秘术 / 10136 死神之镰）：buffRandom 此前未展开，
+        // 导致 b.buffId=undefined → encodeBuffVal(undefined,1)=NaN（audit_dream_effect_shape 关26 抓获）
+        const bid = Number(b.buffId) || (Array.isArray(b.buffRandom) && b.buffRandom.length
+          ? Number(b.buffRandom[Math.floor(rnd() * b.buffRandom.length)]) : 0);
+        if (!bid) return;
         // 帕西瓦尔（23200 三城之力）：免疫与己方场地角色同属性敌方角色给予的中毒/烧伤/冰冻/睡眠/混乱
-        if (tar.talent === 23200 && [1, 2, 3, 5, 6].includes(b.buffId)) {
+        if (tar.talent === 23200 && [1, 2, 3, 5, 6].includes(bid)) {
           const sameNatFoe = (allUnits || []).some(u => u && u.hp > 0 && u.side !== tar.side &&
             (allUnits || []).some(a => a && a.hp > 0 && a.side === tar.side && a.nature === u.nature));
           if (sameNatFoe) return;
         }
 
         // 74. 塞勒涅（21230 不寐之月）：自身不会进入睡眠状态
-        if (tar.talent === 21230 && b.buffId === BUFF_IDS.SLEEP) return;
+        if (tar.talent === 21230 && bid === BUFF_IDS.SLEEP) return;
 
         // 81. 修普诺斯（22500 梦境破碎）：自身免疫睡眠外的强制打断（保持自由行动）
-        if (tar.talent === 22500 && b.buffId === BUFF_IDS.SLEEP) return;
+        if (tar.talent === 22500 && bid === BUFF_IDS.SLEEP) return;
 
         // 独角兽（23020 纯洁之兽）：本场战斗内每名己方誓灵可清除/免疫一次异常状态
         if (tar.unicornPurifyAvailable) {
@@ -9227,16 +9353,16 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
         }
 
         // 英勇之心（20280）：正面追加效果（增益类 buff）消失
-        if (suppressPositive && b.buffId >= 10690 && b.buffId < 50000) return;
+        if (suppressPositive && bid >= 10690 && bid < 50000) return;
 
         // 阿佛洛狄忒（22530 美神显现）：天赋持有者免疫任何异常状态
         if (tar.talent === 22530) return;
 
         // 芬芳之守护（20970）/ 10353：窗口内免异常（不消耗次数）
-        if (abnormalWindowBlocked(tar, b.buffId)) return;
+        if (abnormalWindowBlocked(tar, bid)) return;
 
         // 正体不明（21410 鵺）：不会进入异常状态
-        if (tar.talent === 21410 && ABNORMAL_BUFF_IDS.has(Number(b.buffId))) return;
+        if (tar.talent === 21410 && ABNORMAL_BUFF_IDS.has(bid)) return;
 
         // 睡美人（23220 沉睡魔咒）：沉睡状态下免疫1级异常状态
         if (tar.talent === 23220 && (tar.sleepCurseRounds > 0 || (tar.buffs && tar.buffs[BUFF_IDS.SLEEP]))) return;
@@ -9248,14 +9374,14 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
         if (curW === WEATHER_IDS.RAIN && hasManannan) return;
 
         // 判决目标（10359 生死审判）不获增益：正面 buff 黑名单（与 applyExclusiveBuff 同口径）
-        if ((tar.noPositiveRounds || 0) > 0 && POSITIVE_BUFF_IDS.has(b.buffId)) return;
+        if ((tar.noPositiveRounds || 0) > 0 && POSITIVE_BUFF_IDS.has(bid)) return;
 
         const chance = Math.min(100, (b.chance != null ? b.chance : 100) * skillChanceMul(actor));
         if (rnd() * 100 > chance) return;
-        if (abnormalBlocked(tar, b.buffId)) return; // 10375：免疫异常一次（概率命中才消耗）
+        if (abnormalBlocked(tar, bid)) return; // 10375：免疫异常一次（概率命中才消耗）
         tar.buffs = tar.buffs || {};
-        const featInfo = BUFF_FEATURE_IDS[b.buffId] || { apply: 90001 };
-        tar.buffs[b.buffId] = {
+        const featInfo = BUFF_FEATURE_IDS[bid] || { apply: 90001 };
+        tar.buffs[bid] = {
           level: 1,
           duration: b.duration || 3,
         };
@@ -9269,10 +9395,13 @@ function applySkillEffects(actor, cfg, targets, allUnits, actIndex, battleState)
           id: featInfo.apply,
           effect_phase: phase,
           change_type: 300019, // FIGHT_EFF_CHANGE_TYPE_ADD_BUFF
-          change_value: [encodeBuffVal(b.buffId, 1)],
+          change_value: [encodeBuffVal(bid, 1)],
           remove_round: b.duration || 3,
         });
-        if (b.requireYellowSign) tar.yellowSign = false; // 消印（desc：消除目标的黄印标记）
+        if (b.requireYellowSign) {
+          tar.yellowSign = false; // 消印（desc：消除目标的黄印标记）
+          pushStackBuffEffect(effects, { buffId: 22440, stacks: 0, tarId: tar.id, srcId: 22440, srcServantId: actor.id, atkId: actor.id, phase });
+        }
       });
     });
   }
@@ -9696,7 +9825,7 @@ function settleRoundEndTicks(units, battleState) {
           u.hp = Math.max(0, u.hp - dmg);
           effects.push({
             trigger_count: 0, atk_servant_id: naga.id, src_servant_id: naga.id, tar_servant_ids: [u.id],
-            src_type: 1, src_id: 22250, id: 22250, effect_phase: 7,
+            src_type: 1, src_id: 22250, id: 22251, effect_phase: 7, // FightFeature[22251] act=20661
             change_type: 200000, change_value: [-dmg], remove_round: 0,
           });
         }
@@ -10596,6 +10725,7 @@ function settleRoundEndTicks(units, battleState) {
       u.athenaShields = 2;
       u.athenaDmgBoostCurr = u.athenaDmgBoostNext || 0;
       u.athenaDmgBoostNext = 0;
+      pushStackBuffEffect(effects, { buffId: 21530, stacks: 2, tarId: u.id, srcId: 21530, srcServantId: u.id, atkId: u.id, phase: 7 });
     }
   });
 
@@ -10610,13 +10740,27 @@ function settleRoundEndTicks(units, battleState) {
   // 奥西里斯（20930 冥界归还）：力尽结算与增伤生效
   (units || []).forEach(u => {
     if (u && u.pendingFaint) {
+      const beforeHp = Number(u.hp) || 0;
+      const osiris = u.osirisSavedBy ? (units || []).find(x => x && x.id === u.osirisSavedBy && x.hp > 0) : null;
       u.hp = 0;
       u.pendingFaint = false;
-      if (u.osirisSavedBy) {
-        const osiris = (units || []).find(x => x && x.id === u.osirisSavedBy && x.hp > 0);
-        if (osiris) {
-          osiris.osirisNextDmg = (osiris.osirisNextDmg || 0) + 0.75;
-        }
+      if (beforeHp > 0) {
+        effects.push({
+          trigger_count: 0,
+          atk_servant_id: u.id,
+          src_servant_id: osiris ? osiris.id : u.id,
+          tar_servant_ids: [u.id],
+          src_type: 1,
+          src_id: 20930,
+          id: 20931, // FightFeature[20931] showName=0, act=20654
+          effect_phase: 7,
+          change_type: 200000,
+          change_value: [-beforeHp],
+          remove_round: 0,
+        });
+      }
+      if (osiris) {
+        osiris.osirisNextDmg = (osiris.osirisNextDmg || 0) + 0.75;
       }
     }
   });
@@ -10747,7 +10891,7 @@ function settleRoundEndTicks(units, battleState) {
           tar_servant_ids: [e.id],
           src_type: 1,
           src_id: 22110,
-          id: 22110,
+          id: 22111, // FightFeature[22111] act=20661
           effect_phase: 7,
           change_type: 200000,
           change_value: [-dmg],
@@ -10864,7 +11008,7 @@ function settleRoundEndTicks(units, battleState) {
             tar_servant_ids: [e.id],
             src_type: 1,
             src_id: 22220,
-            id: 22220,
+            id: 22221, // FightFeature[22221] act=20661
             effect_phase: 7,
             change_type: 200000,
             change_value: [-totalRetaliateDmg],
@@ -11019,25 +11163,7 @@ function settleRoundEndTicks(units, battleState) {
     const maxSpd = Math.max(...allSpeeds);
     const mySpd = effectiveSpeed(yin, units, battleState);
     if (mySpd < maxSpd) {
-      const delta = gainStat(yin, 105, 1, { effects, srcId: yin.talent || 22010, atkId: yin.id, srcServantId: yin.id, phase: 7 });
-      const newSpd = (yin.statLevels && yin.statLevels[105]) || 0;
-      const an = PROP_ATTR_NAMES[105];
-      if (an) yin[an] = newSpd;
-      if (delta > 0) {
-        effects.push({
-          trigger_count: 0,
-          atk_servant_id: yin.id,
-          src_servant_id: yin.id,
-          tar_servant_ids: [yin.id],
-          src_type: 1,
-          src_id: 22010,
-          id: 22010,
-          effect_phase: 7,
-          change_type: 100000,
-          change_value: [encodeAttrVal(105, delta, newSpd)],
-          remove_round: 0,
-        });
-      }
+      gainStat(yin, 105, 1, { effects, srcId: 22010, atkId: yin.id, srcServantId: yin.id, phase: 7 });
     }
   });
 
@@ -11079,51 +11205,13 @@ function settleRoundEndTicks(units, battleState) {
         const tar = foes[Math.floor(Math.random() * foes.length)];
         const props = [101, 102, 103, 104, 105, 111, 113, 115];
         const p = props[Math.floor(Math.random() * props.length)];
-        tar.statLevels = tar.statLevels || {};
-        tar.statLevels[p] = Math.max(-6, (tar.statLevels[p] || 0) - 1);
-        const fan = PROP_ATTR_NAMES[p];
-        if (fan) tar[fan] = tar.statLevels[p];
+        gainStat(tar, p, -1, { effects, srcId: 21070, atkId: u.id, srcServantId: u.id, phase: 7 });
         const allies = (units || []).filter(a => a && a.hp > 0 && a.side === u.side);
         const chosen = allies.slice().sort(() => Math.random() - 0.5).slice(0, 2);
-        const allyGains = [];
         chosen.forEach(a => {
           const boost = 1 + Math.floor(Math.random() * 2);
-          a.statLevels = a.statLevels || {};
-          const aOld = Number(a.statLevels[p]) || 0;
-          const aNew = Math.min(6, aOld + boost);
-          const aDelta = aNew - aOld;
-          a.statLevels[p] = aNew;
-          const an = PROP_ATTR_NAMES[p];
-          if (an) a[an] = aNew;
-          if (aDelta > 0) allyGains.push({ id: a.id, delta: aDelta });
+          gainStat(a, p, boost, { effects, srcId: 21070, atkId: u.id, srcServantId: u.id, phase: 7 });
         });
-        effects.push({
-          trigger_count: 0,
-          atk_servant_id: u.id,
-          src_servant_id: u.id,
-          tar_servant_ids: [tar.id],
-          src_type: 1,
-          src_id: 21070,
-          id: 21070,
-          effect_phase: 7,
-          change_type: 100000,
-          change_value: [encodeAttrVal(p, -1, tar.statLevels[p])],
-          remove_round: 0,
-        });
-        // 己方那 2 人的加成原先没有任何事件 —— 玩家只看到敌人掉等级
-        allyGains.forEach(g => effects.push({
-          trigger_count: 0,
-          atk_servant_id: u.id,
-          src_servant_id: u.id,
-          tar_servant_ids: [g.id],
-          src_type: 1,
-          src_id: 21070,
-          id: PROP_FEATURE_IDS[p] || 20001,
-          effect_phase: 7,
-          change_type: 100000,
-          change_value: [encodeAttrVal(p, g.delta)],
-          remove_round: 0,
-        }));
       }
     }
 
@@ -11224,34 +11312,9 @@ function settleRoundEndTicks(units, battleState) {
     // 51. 狼人-月夜（21370 狂怒解放）：回合末物攻速度上升1~2级，双防下降1级
     if (u.talent === 21370) {
       const up = 1 + Math.floor(Math.random() * 2);
-      u.statLevels = u.statLevels || {};
-      [101, 105].forEach(p => {
-        u.statLevels[p] = Math.min(6, (u.statLevels[p] || 0) + up);
-        const an = PROP_ATTR_NAMES[p];
-        if (an) u[an] = u.statLevels[p];
-      });
-      [103, 104].forEach(p => {
-        u.statLevels[p] = Math.max(-6, (u.statLevels[p] || 0) - 1);
-        const an = PROP_ATTR_NAMES[p];
-        if (an) u[an] = u.statLevels[p];
-      });
-      // 每项升降各发一条 100000 属性 effect（20001/20005 上、20003/20004 下）——
-      // 官方展示：act（升）与 act2（降）由 change_value 符号位选择，只发攻一条玩家看不到
-      // 速度/双防变化（2026-10-12「被动没效果」反馈实证）
+      // 每项升降各发一条 100000 属性 effect（20001/20005 上、20003/20004 下），经 gainStat 统一钳制与去零
       [[101, up], [105, up], [103, -1], [104, -1]].forEach(([p, d]) => {
-        effects.push({
-          trigger_count: 0,
-          atk_servant_id: u.id,
-          src_servant_id: u.id,
-          tar_servant_ids: [u.id],
-          src_type: 1,
-          src_id: 21370,
-          id: PROP_FEATURE_IDS[p] || 20001,
-          effect_phase: 7,
-          change_type: 100000,
-          change_value: [encodeAttrVal(p, d)],
-          remove_round: 0,
-        });
+        gainStat(u, p, d, { effects, srcId: 21370, atkId: u.id, srcServantId: u.id, phase: 7 });
       });
     }
 
@@ -11280,7 +11343,7 @@ function settleRoundEndTicks(units, battleState) {
         pick.hp = Math.min(pick.maxHp, pick.hp + heal);
         effects.push({
           trigger_count: 0, atk_servant_id: u.id, src_servant_id: u.id, tar_servant_ids: [pick.id],
-          src_type: 1, src_id: 20710, id: 20710, effect_phase: 7,
+          src_type: 1, src_id: 20710, id: 20711, effect_phase: 7, // FightFeature[20711] act=20015
           change_type: 200000, change_value: [heal], remove_round: 0,
         });
       }
@@ -11324,7 +11387,7 @@ function settleRoundEndTicks(units, battleState) {
           victim.hp = Math.max(0, victim.hp - dmg);
           effects.push({
             trigger_count: 0, atk_servant_id: u.id, src_servant_id: u.id, tar_servant_ids: [victim.id],
-            src_type: 1, src_id: 21480, id: 21480, effect_phase: 7,
+            src_type: 1, src_id: 21480, id: 21481, effect_phase: 7, // FightFeature[21481] act=20661
             change_type: 200000, change_value: [-dmg], remove_round: 0,
           });
         }
@@ -11398,6 +11461,8 @@ function settleRoundEndTicks(units, battleState) {
           const props = [101, 102, 103, 104, 105];
           const p = props[Math.floor(Math.random() * props.length)];
           gainStat(a, p, boost, { effects, srcId: 22700, atkId: u.id, srcServantId: u.id, phase: 7 });
+          a.zashikiStacks = Math.min(8, (a.zashikiStacks || 0) + 1);
+          pushStackBuffEffect(effects, { buffId: 22700, stacks: a.zashikiStacks, tarId: a.id, srcId: 22700, srcServantId: u.id, atkId: u.id, phase: 7 });
         }
       });
     }
@@ -11444,7 +11509,7 @@ function settleRoundEndTicks(units, battleState) {
             tar_servant_ids: [f.id],
             src_type: 1,
             src_id: 20860,
-            id: 20860,
+            id: 20861, // FightFeature[20861] act=20661
             effect_phase: 7,
             change_type: 200000,
             change_value: [-dmg],
@@ -11464,6 +11529,7 @@ function settleRoundEndTicks(units, battleState) {
       const foes = (units || []).filter(f => f && f.hp > 0 && f.side !== u.side && (f.lamentStacks || 0) >= 2);
       foes.forEach(f => {
         f.lamentStacks -= 2;
+        pushStackBuffEffect(effects, { buffId: 22620, stacks: Math.min(10, f.lamentStacks), tarId: f.id, srcId: 22620, srcServantId: u.id, atkId: u.id, phase: 7 });
         const p = Math.random() < 0.5 ? 101 : 102;
         f.statLevels = f.statLevels || {};
         const oldLv = f.statLevels[p] || 0;
@@ -11496,22 +11562,7 @@ function settleRoundEndTicks(units, battleState) {
       if (allies.length > 0) {
         const tar = allies[Math.floor(Math.random() * allies.length)];
         gainStat(u, 102, -1, { effects, srcId: 21440, atkId: u.id, srcServantId: u.id, phase: 7 });
-        gainStat(tar, 102, 1, { effects, srcId: 21440, atkId: u.id, srcServantId: tar.id, phase: 7 });
-        const tan = PROP_ATTR_NAMES[102];
-        if (tan) tar[tan] = tar.statLevels[102];
-        effects.push({
-          trigger_count: 0,
-          atk_servant_id: u.id,
-          src_servant_id: u.id,
-          tar_servant_ids: [tar.id],
-          src_type: 1,
-          src_id: 21440,
-          id: 21440,
-          effect_phase: 7,
-          change_type: 100000,
-          change_value: [encodeAttrVal(102, 1, tar.statLevels[102])],
-          remove_round: 0,
-        });
+        gainStat(tar, 102, 1, { effects, srcId: 21440, atkId: u.id, srcServantId: u.id, phase: 7 });
       }
     }
 
@@ -11587,7 +11638,7 @@ function settleRoundEndTicks(units, battleState) {
             atk_servant_id: dt.ownerId || u.id,
             src_servant_id: dt.ownerId || u.id,
             tar_servant_ids: [u.id],
-            src_type: 3, src_id: 10235, id: 60120, effect_phase: 7,
+            src_type: 3, src_id: 10235, id: 12211, effect_phase: 7, // FightFeature[12211] 食时之城 act=20661
             change_type: 200000, change_value: [-loss], remove_round: 0,
           });
         });
@@ -11602,7 +11653,7 @@ function settleRoundEndTicks(units, battleState) {
                 atk_servant_id: res.stolen ? res.receiver.id : owner.id,
                 src_servant_id: res.stolen ? res.receiver.id : owner.id,
                 tar_servant_ids: [res.receiver.id],
-                src_type: 3, src_id: res.stolen ? 10151 : 10235, id: 60120, effect_phase: 7,
+                src_type: 3, src_id: res.stolen ? 10151 : 10235, id: res.stolen ? 60120 : 12210, effect_phase: 7, // FightFeature[12210] 食时之城 act=20015
                 change_type: 200000, change_value: [res.real], remove_round: 0,
               });
             }
@@ -11616,6 +11667,17 @@ function settleRoundEndTicks(units, battleState) {
       if (field.lazyAura && field.lazyAura.rounds > 0) {
         field.lazyAura.rounds -= 1;
         if (field.lazyAura.rounds <= 0) delete field.lazyAura;
+      }
+    });
+  }
+  // 己方场地效果（10241 冰之结界）回合末递减
+  if (battleState && battleState.allyFields) {
+    [0, 1].forEach(side => {
+      const af = battleState.allyFields[side];
+      if (!af) return;
+      if (af.iceBarrier && af.iceBarrier.rounds > 0) {
+        af.iceBarrier.rounds -= 1;
+        if (af.iceBarrier.rounds <= 0) delete af.iceBarrier;
       }
     });
   }
@@ -12180,23 +12242,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
       allies.forEach(a => {
         const props = [101, 102, 103, 104, 105, 111, 113, 115];
         const p = props[Math.floor(rnd() * props.length)];
-        a.statLevels = a.statLevels || {};
-        a.statLevels[p] = Math.min(6, (a.statLevels[p] || 0) + 1);
-        const an = PROP_ATTR_NAMES[p];
-        if (an) a[an] = a.statLevels[p];
-      });
-      effects.push({
-        trigger_count: 0,
-        atk_servant_id: actor.id,
-        src_servant_id: actor.id,
-        tar_servant_ids: allies.map(a => a.id),
-        src_type: 1,
-        src_id: 21010,
-        id: 21010,
-        effect_phase: phase,
-        change_type: 100000,
-        change_value: [],
-        remove_round: 0,
+        gainStat(a, p, 1, { effects, srcId: 21010, atkId: actor.id, srcServantId: actor.id, phase });
       });
     }
   }
@@ -12253,20 +12299,20 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
             tar_servant_ids: [tar.id],
             src_type: 1,
             src_id: 21100,
-            id: 21100,
+            id: 21101, // FightFeature[21101] act=20658 爆发演出
             effect_phase: phase,
             change_type: 200000,
             change_value: [-burst],
             remove_round: 0,
           });
+          pushStackBuffEffect(effects, { buffId: 21100, stacks: 0, tarId: tar.id, srcId: 21100, srcServantId: actor.id, atkId: actor.id, phase });
         } else if (tar.cancerClawStacks === 1) {
           // 偷取1项能力
           const props = [101, 102, 103, 104, 105];
           const p = props[Math.floor(rnd() * props.length)];
-          tar.statLevels = tar.statLevels || {};
-          actor.statLevels = actor.statLevels || {};
-          tar.statLevels[p] = Math.max(-6, (tar.statLevels[p] || 0) - 1);
-          actor.statLevels[p] = Math.min(6, (actor.statLevels[p] || 0) + 1);
+          gainStat(tar, p, -1, { effects, srcId: 21100, atkId: actor.id, srcServantId: actor.id, phase });
+          gainStat(actor, p, 1, { effects, srcId: 21100, atkId: actor.id, srcServantId: actor.id, phase });
+          pushStackBuffEffect(effects, { buffId: 21100, stacks: 1, tarId: tar.id, srcId: 21100, srcServantId: actor.id, atkId: actor.id, phase, showBanner: true });
         }
       }
     });
@@ -12275,6 +12321,18 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   // 94. 狮子座（21110 狮王之裘）：造成一次伤害后积累1层
   if (actor.talent === 21110 && cfg.power > 0) {
     actor.leoFurStacks = Math.min(5, (actor.leoFurStacks || 0) + 1);
+    pushStackBuffEffect(effects, { buffId: 21110, stacks: actor.leoFurStacks, tarId: actor.id, srcId: 21110, srcServantId: actor.id, atkId: actor.id, phase });
+  }
+  // 76. 赫拉克勒斯（21550 十二功绩）：自身使用技能后增加1次功绩（上限12，满12次物攻速度+2）
+  if (actor.talent === 21550 && actor.hp > 0) {
+    actor.heraclesFeats = Math.min(12, (actor.heraclesFeats || 0) + 1);
+    pushStackBuffEffect(effects, { buffId: 21550, stacks: actor.heraclesFeats, tarId: actor.id, srcId: 21550, srcServantId: actor.id, atkId: actor.id, phase });
+    if (actor.heraclesFeats >= 12 && !actor.heraclesMaxFired) {
+      actor.heraclesMaxFired = true;
+      [101, 105].forEach(p => {
+        gainStat(actor, p, 2, { effects, srcId: 21550, atkId: actor.id, srcServantId: actor.id, phase });
+      });
+    }
   }
 
   // 101. 卯（22020 兔子的仙药）：使用一次辅助技能后己方所有誓灵随机获得一种增益
@@ -12283,23 +12341,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
     allies.forEach(a => {
       const props = [101, 102, 103, 104, 105, 111, 113, 115];
       const p = props[Math.floor(rnd() * props.length)];
-      a.statLevels = a.statLevels || {};
-      a.statLevels[p] = Math.min(6, (a.statLevels[p] || 0) + 1);
-      const an = PROP_ATTR_NAMES[p];
-      if (an) a[an] = a.statLevels[p];
-    });
-    effects.push({
-      trigger_count: 0,
-      atk_servant_id: actor.id,
-      src_servant_id: actor.id,
-      tar_servant_ids: allies.map(a => a.id),
-      src_type: 1,
-      src_id: 22020,
-      id: 22020,
-      effect_phase: phase,
-      change_type: 100000,
-      change_value: [],
-      remove_round: 0,
+      gainStat(a, p, 1, { effects, srcId: 22020, atkId: actor.id, srcServantId: actor.id, phase });
     });
   }
 
@@ -12372,6 +12414,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   if (actor.talent === 22720 && (Number(cfg.kind) === 3 || isFriendEff(cfg.effType)) && (actor.asuraWill || 0) >= 50) {
     actor.asuraWill -= 50;
     actor.asuraPriorityUp = 2;
+    pushStackBuffEffect(effects, { buffId: 22720, stacks: actor.asuraWill, tarId: actor.id, srcId: 22720, srcServantId: actor.id, atkId: actor.id, phase });
   }
 
   // 125. 凯布利（22850 圣甲虫之秘）：己方下次攻击附带失血百分比75%的增伤与吸血
@@ -12405,9 +12448,8 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
           const posProps = Object.keys(tar.statLevels).filter(k => tar.statLevels[k] > 0).slice(0, 3);
           posProps.forEach(pk => {
             const p = Number(pk);
-            tar.statLevels[p] = Math.max(-6, tar.statLevels[p] - 1);
-            actor.statLevels = actor.statLevels || {};
-            actor.statLevels[p] = Math.min(6, (actor.statLevels[p] || 0) + 1);
+            gainStat(tar, p, -1, { effects, srcId: 23160, atkId: actor.id, srcServantId: actor.id, phase });
+            gainStat(actor, p, 1, { effects, srcId: 23160, atkId: actor.id, srcServantId: actor.id, phase });
           });
         }
       }
@@ -12457,13 +12499,14 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
     });
   }
 
-  // 37. 莎莉叶（22550 光暗交织）：与光暗属性誓灵交互后叠层增伤（最高50%）
-  if (actor.talent === 22550 && (cfg.nature === 5 || cfg.nature === 6)) {
+  // 37. 莎莉叶（22550 光暗交织）：攻击光暗属性誓灵或被光暗属性誓灵攻击1次，自身造成伤害+10%（上限50%）
+  if (actor.talent === 22550 && (targets || []).some(tar => tar && tar.side !== actor.side && ((tar.nature || natureOf(tar.type)) === 5 || (tar.nature || natureOf(tar.type)) === 6))) {
     actor.sharayahStacks = Math.min(5, (actor.sharayahStacks || 0) + 1);
   }
-  if ((targets || []).some(tar => tar && tar.talent === 22550 && (cfg.nature === 5 || cfg.nature === 6))) {
+  const actorNat22550 = actor.nature || natureOf(actor.type);
+  if (actorNat22550 === 5 || actorNat22550 === 6) {
     (targets || []).forEach(tar => {
-      if (tar && tar.talent === 22550) {
+      if (tar && tar.hp > 0 && tar.side !== actor.side && tar.talent === 22550) {
         tar.sharayahStacks = Math.min(5, (tar.sharayahStacks || 0) + 1);
       }
     });
@@ -12541,7 +12584,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   if (actor.talent === 20010 && cfg.nature === 2 && Array.isArray(results)) {
     const damagedTargets = results.filter(r => r.hurt > 0);
     damagedTargets.forEach(r => {
-      const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0);
+      const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0 && u.side !== actor.side);
       if (tar) {
         [103, 104].forEach(prop => {
           tar.statLevels = tar.statLevels || {};
@@ -12664,7 +12707,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   if (actor.talent === 22540 && Array.isArray(results)) {
     results.forEach(r => {
       if (Number(r.hurt) > 0 || Number(r.shield_hurt) > 0) {
-        const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0);
+        const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0 && u.side !== actor.side);
         if (tar && ((tar.hp / tar.maxHp) < 0.5 || actor.arroganceBoth)) {
           const props = [101, 102, 103, 104, 105, 111, 113, 115];
           const shuffled = props.slice().sort(() => rnd() - 0.5);
@@ -12704,11 +12747,12 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   if (actor.talent === 22750 && Array.isArray(results)) {
     results.forEach(r => {
       if (Number(r.hurt) > 0 || Number(r.shield_hurt) > 0) {
-        const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0);
+        const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0 && u.side !== actor.side);
         if (tar) {
           tar.hearts = (tar.hearts || 0) + 1;
           if (tar.hearts >= 3) {
             tar.hearts = 0;
+            pushStackBuffEffect(effects, { buffId: 22750, stacks: 0, tarId: tar.id, srcId: 22750, srcServantId: actor.id, atkId: actor.id, phase });
             const allProps = [101, 102, 103, 104, 105, 111, 113, 115];
             const changeVals = [];
             allProps.forEach(p => {
@@ -12749,10 +12793,12 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
                 id: BUFF_FEATURE_IDS[BUFF_IDS.SLEEP].apply,
                 effect_phase: phase,
                 change_type: 300019,
-                change_value: [BUFF_IDS.SLEEP],
+                change_value: [encodeBuffVal(BUFF_IDS.SLEEP, 1)],
                 remove_round: 3,
               });
             }
+          } else {
+            pushStackBuffEffect(effects, { buffId: 22750, stacks: tar.hearts, tarId: tar.id, srcId: 22750, srcServantId: actor.id, atkId: actor.id, phase, showBanner: true });
           }
         }
       }
@@ -12835,7 +12881,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
             tar_servant_ids: [tar.id],
             src_type: 1, // FIGHT_EFF_FEATURE
             src_id: 21310,
-            id: 21310,
+            id: 21311, // FightFeature[21311] act=20660
             effect_phase: phase,
             change_type: 200000,
             change_value: [-dmg],
@@ -12846,18 +12892,23 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
     }
   }
 
-  // 11. 时崎狂三（21650 梦魇）：己方暗属性技能造成伤害后，使目标获得1层【束缚之影】；3层扣除25%最大生命
-  if (cfg.nature === 6) {
+  // 11. 时崎狂三（21650 梦魇）：己方暗属性誓灵造成伤害后，目标获得1层【束缚之影】，累积3层时损失最大HP的25%并重置
+  // （2026-11-22 修复：原判 cfg.nature===6 错把暗属性誓灵当暗属性技能；1~2 层改走 300019 encodeBuffVal(21650, N)
+  //  挂 CfgBuff[21650] buffIcon_nightmare 图标与层数；第 3 层走 FightFeature[216501](act=20661) 爆发演出 + 300020 摘图标）
+  if ((actor.nature || natureOf(actor.type)) === 6) {
     const kurumi = (allUnits || []).find(u => u && u.hp > 0 && u.side === actor.side && u.talent === 21650);
     if (kurumi) {
+      const kurumiRule = TALENT_RULES[21650] || {};
+      const sbThreshold = Number(kurumiRule.shadowBindThreshold) || 3;
+      const sbDmgRatio = Number(kurumiRule.shadowBindMaxHpDmg) || 0.25;
       (results || []).forEach(r => {
         if (r.hurt > 0 || r.shield_hurt > 0) {
-          const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0);
+          const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0 && u.side !== actor.side);
           if (tar) {
             tar.shadow_bind = (tar.shadow_bind || 0) + 1;
-            if (tar.shadow_bind >= 3) {
+            if (tar.shadow_bind >= sbThreshold) {
               tar.shadow_bind = 0;
-              const maxHpDmg = Math.max(1, Math.round(tar.maxHp * 0.25));
+              const maxHpDmg = Math.max(1, Math.round((tar.maxHp || 1) * sbDmgRatio));
               tar.hp = Math.max(0, tar.hp - maxHpDmg);
               effects.push({
                 trigger_count: 0,
@@ -12866,10 +12917,23 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
                 tar_servant_ids: [tar.id],
                 src_type: 1,
                 src_id: 21650,
-                id: 21650,
+                id: 216501, // FightFeature[216501] act=20661 爆发演出（21650 为无动画基础条）
                 effect_phase: phase,
                 change_type: 200000,
                 change_value: [-maxHpDmg],
+                remove_round: 0,
+              });
+              effects.push({
+                trigger_count: 0,
+                atk_servant_id: actor.id,
+                src_servant_id: kurumi.id,
+                tar_servant_ids: [tar.id],
+                src_type: 3,
+                src_id: 60120,
+                id: 60120, // 静默摘除束缚之影 debuff 图标
+                effect_phase: phase,
+                change_type: 300020,
+                change_value: [21650],
                 remove_round: 0,
               });
             } else {
@@ -12882,8 +12946,8 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
                 src_id: 21650,
                 id: 21650,
                 effect_phase: phase,
-                change_type: 0,
-                change_value: [tar.shadow_bind],
+                change_type: 300019,
+                change_value: [encodeBuffVal(21650, tar.shadow_bind)],
                 remove_round: 0,
               });
             }
@@ -12898,7 +12962,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   if (xingciUnit && isSoundSkill(cfg.id)) {
     (results || []).forEach(r => {
       if (r.hurt > 0 || r.shield_hurt > 0) {
-        const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0);
+        const tar = (allUnits || []).find(u => u && u.id === r.target && u.hp > 0 && u.side !== actor.side);
         if (tar) {
           tar.soundVulnRatio = (tar.soundVulnRatio || 0) + 0.20;
           if (tar.soundVulnRatio >= 0.80) {
@@ -12940,7 +13004,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
               tar_servant_ids: [ally.id],
               src_type: 1,
               src_id: 21360,
-              id: 21360,
+              id: 21361, // FightFeature[21361] act=20015
               effect_phase: phase,
               change_type: 200000,
               change_value: [healAmt],
@@ -12992,22 +13056,8 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
             if (actor.yoshinoSpeedDrops >= 3) {
               const matkGains = Math.floor(actor.yoshinoSpeedDrops / 3);
               actor.yoshinoSpeedDrops %= 3;
-              const realDelta = gainStat(actor, 102, matkGains, { effects, srcId: actor.talent || 0, atkId: actor.id, srcServantId: actor.id, phase: 7 });
-              if (realDelta > 0) {
-                effects.push({
-                  trigger_count: 0,
-                  atk_servant_id: actor.id,
-                  src_servant_id: actor.id,
-                  tar_servant_ids: [actor.id],
-                  src_type: 1,
-                  src_id: 21690,
-                  id: 21690,
-                  effect_phase: phase,
-                  change_type: 100000,
-                  change_value: [encodeAttrVal(102, realDelta, (actor.statLevels && actor.statLevels[102]) || 0)],
-                  remove_round: 0,
-                });
-              }
+              // 修复：gainStat 自身已推送 100000 属性变动 effect，删除其后的重复推送并对齐 phase
+              gainStat(actor, 102, matkGains, { effects, srcId: 21690, atkId: actor.id, srcServantId: actor.id, phase });
             }
           }
         }
@@ -13061,50 +13111,55 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
     });
   }
 
-  // 16. 维达（21500 万物复苏）：使用风属性技能后，己方风属性誓灵回复最大HP的7%且随机1项能力+1
-  if (actor.talent === 21500 && cfg.nature === 3) {
-    const windAllies = (allUnits || []).filter(u => u && u.hp > 0 && u.side === actor.side && natureOf(u.type) === 3);
-    windAllies.forEach(ally => {
-      const healAmt = Math.min(ally.maxHp - ally.hp, Math.max(1, Math.round(ally.maxHp * 0.07)));
-      if (healAmt > 0) ally.hp += healAmt;
-      const props = [101, 102, 103, 104, 105, 111, 113, 115];
-      const p = props[Math.floor(rnd() * props.length)];
-      ally.statLevels = ally.statLevels || {};
-      const oldLv = ally.statLevels[p] || 0;
-      const newLv = Math.min(6, oldLv + 1);
-      const delta = newLv - oldLv;
-      ally.statLevels[p] = newLv;
-      const an = PROP_ATTR_NAMES[p];
-      if (an) ally[an] = newLv;
-      effects.push({
-        trigger_count: 0,
-        atk_servant_id: actor.id,
-        src_servant_id: actor.id,
-        tar_servant_ids: [ally.id],
-        src_type: 1,
-        src_id: 21500,
-        id: 21500,
-        effect_phase: phase,
-        change_type: 200000,
-        change_value: [healAmt],
-        remove_round: 0,
+  // 16. 维达（21500 万物复苏）：己方风属性誓灵使用技能后，己方风属性誓灵回复最大HP4%且随机1项能力+1
+  if ((actor.nature || natureOf(actor.type)) === 3) {
+    const vidar = (allUnits || []).find(u => u && u.hp > 0 && u.side === actor.side && u.talent === 21500);
+    if (vidar) {
+      const windAllies = (allUnits || []).filter(u => u && u.hp > 0 && u.side === actor.side && (u.nature || natureOf(u.type)) === 3);
+      windAllies.forEach(ally => {
+        const healAmt = Math.min(ally.maxHp - ally.hp, Math.max(1, Math.round(ally.maxHp * 0.04)));
+        if (healAmt > 0) ally.hp += healAmt;
+        const props = [101, 102, 103, 104, 105, 111, 113, 115];
+        const p = props[Math.floor(rnd() * props.length)];
+        ally.statLevels = ally.statLevels || {};
+        const oldLv = ally.statLevels[p] || 0;
+        const newLv = Math.min(6, oldLv + 1);
+        const delta = newLv - oldLv;
+        ally.statLevels[p] = newLv;
+        const an = PROP_ATTR_NAMES[p];
+        if (an) ally[an] = newLv;
+        if (healAmt > 0) {
+          effects.push({
+            trigger_count: 0,
+            atk_servant_id: actor.id,
+            src_servant_id: vidar.id,
+            tar_servant_ids: [ally.id],
+            src_type: 1,
+            src_id: 21500,
+            id: 21500,
+            effect_phase: phase,
+            change_type: 200000,
+            change_value: [healAmt],
+            remove_round: 0,
+          });
+        }
+        if (delta > 0) {
+          effects.push({
+            trigger_count: 0,
+            atk_servant_id: actor.id,
+            src_servant_id: vidar.id,
+            tar_servant_ids: [ally.id],
+            src_type: 1,
+            src_id: 21500,
+            id: PROP_FEATURE_IDS[p] || 20000,
+            effect_phase: phase,
+            change_type: 100000,
+            change_value: [encodeAttrVal(p, delta, newLv)],
+            remove_round: 0,
+          });
+        }
       });
-      if (delta > 0) {
-        effects.push({
-          trigger_count: 0,
-          atk_servant_id: actor.id,
-          src_servant_id: actor.id,
-          tar_servant_ids: [ally.id],
-          src_type: 1,
-          src_id: 21500,
-          id: PROP_FEATURE_IDS[p] || 20000,
-          effect_phase: phase,
-          change_type: 100000,
-          change_value: [encodeAttrVal(p, delta, newLv)],
-          remove_round: 0,
-        });
-      }
-    });
+    }
   }
 
   // 17. 应龙（20820 大地的恩泽）：在场时，己方土系誓灵受到技能伤害后回复最大生命5%且命中、速度提升1级
@@ -13349,26 +13404,28 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   if (actor.talent === 21170) {
     const livingAllies = (allUnits || []).filter(u => u && u.hp > 0 && u.side === actor.side);
     if (livingAllies.length >= 2) {
-      livingAllies.sort((a, b) => a.hp - b.hp);
+      livingAllies.sort((a, b) => (a.hp / unitMaxHpOf(a)) - (b.hp / unitMaxHpOf(b)) || (a.hp - b.hp));
       const lowest = livingAllies[0];
       const highest = livingAllies[livingAllies.length - 1];
-      const avgHp = Math.floor((lowest.hp + highest.hp) / 2);
-      lowest.hp = Math.min(lowest.maxHp, avgHp);
-      highest.hp = Math.min(highest.maxHp, avgHp);
+      const avgChanges = averageUnitsHpByRatio([lowest, highest]);
       lowest.currDmgBonus = (lowest.currDmgBonus || 0) + 0.50;
       highest.currDmgBonus = (highest.currDmgBonus || 0) + 0.50;
-      effects.push({
-        trigger_count: 0,
-        atk_servant_id: actor.id,
-        src_servant_id: actor.id,
-        tar_servant_ids: [lowest.id, highest.id],
-        src_type: 1,
-        src_id: 21170,
-        id: 21170,
-        effect_phase: phase,
-        change_type: 200000,
-        change_value: [lowest.hp, highest.hp],
-        remove_round: 0,
+      avgChanges.forEach(({ unit: m, delta }) => {
+        if (delta !== 0) {
+          effects.push({
+            trigger_count: 0,
+            atk_servant_id: actor.id,
+            src_servant_id: actor.id,
+            tar_servant_ids: [m.id],
+            src_type: 1,
+            src_id: 21170,
+            id: 21170,
+            effect_phase: phase,
+            change_type: 200000,
+            change_value: [delta],
+            remove_round: 0,
+          });
+        }
       });
     }
   }
@@ -13378,6 +13435,7 @@ function checkTalentsAfterSkill(actor, cfg, targets, results, allUnits, actIndex
   if (cfg.nature === 1 || cfg.nature === 4) {
     (allUnits || []).filter(u => u && u.hp > 0 && u.side === actor.side && u.talent === 22930).forEach(yl => {
       yl.trueDragonLayers = Math.min(15, (yl.trueDragonLayers || 0) + 1);
+      pushStackBuffEffect(effects, { buffId: 22930, stacks: yl.trueDragonLayers, tarId: yl.id, srcId: 22930, srcServantId: yl.id, atkId: actor.id, phase });
     });
   }
 
@@ -13579,7 +13637,7 @@ function settleRoundStartTalents(units, round, actIndex, battleState) {
           tar_servant_ids: [u.id],
           src_type: 1, // FIGHT_EFF_FEATURE
           src_id: 23280,
-          id: 23280,
+          id: 232801, // FightFeature[232801] act=20015 涅槃回血动画
           effect_phase: 1, // TRIGGER_TIME_ROUND_START
           change_type: 200000, // HP change
           change_value: [maxHp],
@@ -13596,7 +13654,7 @@ function settleRoundStartTalents(units, round, actIndex, battleState) {
           tar_servant_ids: [u.id],
           src_type: 1,
           src_id: 23280,
-          id: 23280,
+          id: 232800, // FightFeature[232800] act=20656 泣朱自损动画
           effect_phase: 1,
           change_type: 200000,
           change_value: [-selfDmg],
@@ -13717,8 +13775,8 @@ function settleRoundStartTalents(units, round, actIndex, battleState) {
           src_id: 22440,
           id: 22440,
           effect_phase: 1, // TRIGGER_TIME_ROUND_START
-          change_type: 0,
-          change_value: [],
+          change_type: 300019,
+          change_value: [encodeBuffVal(22440, 1)],
           remove_round: 0,
         });
       }
@@ -13811,25 +13869,23 @@ function settleRoundStartTalents(units, round, actIndex, battleState) {
     if (!u || u.hp <= 0) return;
 
     // 84. 处女座（21000 阿赖耶识）：回合初将我方誓灵生命值平均分配
-    // 2026-10-27：护盾分支原先只改 a.shield + 一条 change_type=0 空 effect —— 客户端护盾条
-    // 只有 200001 effect / 被击 final_shield 两条同步通道，授予瞬间零反馈（用户报"看不见护盾"）。
-    // 照 23100 冰糖燕窝同款修法：逐人推 200001 + 官方展示条目 21002（act 20505 = P_jdfy 护盾动画）。
+    // 2026-10-27：补 200001 + 21002（护盾动画）；2026-11-24：按生命百分比平均分配（方案A），
+    // 并为所有血量变化者补发 200000（id=21001 官方演出）同步客户端血条（否则只改内存不生效）。
     if (u.talent === 21000) {
       const allies = (units || []).filter(a => a && a.hp > 0 && a.side === u.side);
       if (allies.length > 0) {
-        const totalHp = allies.reduce((s, a) => s + a.hp, 0);
-        const avg = Math.floor(totalHp / allies.length);
-        allies.forEach(a => {
-          const before = a.hp;
-          a.hp = Math.min(a.maxHp, avg);
-          if (a.hp > before) {
+        const props = [101, 102, 103, 104, 105, 111, 113, 115];
+        averageUnitsHpByRatio(allies).forEach(({ unit: a, delta }) => {
+          if (delta !== 0) {
+            effects.push(featureFxEffect(u, 21000, 21001, 200000, [delta], [a.id], 1));
+          }
+          if (delta > 0) {
             // 血量上升：随机1项能力+2级（gainStat 自带 100000 演出；phase 对齐回合初同族口径）
-            const props = [101, 102, 103, 104, 105, 111, 113, 115];
             const p = props[Math.floor(Math.random() * props.length)];
             gainStat(a, p, 2, { effects, srcId: 21000, atkId: u.id, srcServantId: u.id, phase: 1 });
           } else {
             // 血量下降或不变：获得10%护盾（src_id=21000 横幅取名、id=21002 官方演出条目）
-            const shieldVal = Math.max(1, Math.round(a.maxHp * 0.10));
+            const shieldVal = Math.max(1, Math.round(unitMaxHpOf(a) * 0.10));
             a.shield = (Number(a.shield) || 0) + shieldVal;
             effects.push(featureFxEffect(u, 21000, 21002, 200001, [shieldVal], [a.id], 1));
           }
@@ -13873,22 +13929,7 @@ function settleRoundStartTalents(units, round, actIndex, battleState) {
 
     // 54. 密米尔（21440 智慧流转）：每回合开始时提升1级魔攻
     if (u.talent === 21440) {
-      const delta = gainStat(u, 102, 1, { effects, srcId: 21440, atkId: u.id, srcServantId: u.id, phase: 1 });
-      if (delta > 0) {
-        effects.push({
-          trigger_count: 0,
-          atk_servant_id: u.id,
-          src_servant_id: u.id,
-          tar_servant_ids: [u.id],
-          src_type: 1,
-          src_id: 21440,
-          id: 21440,
-          effect_phase: 1,
-          change_type: 100000,
-          change_value: [encodeAttrVal(102, delta, (u.statLevels && u.statLevels[102]) || 0)],
-          remove_round: 0,
-        });
-      }
+      gainStat(u, 102, 1, { effects, srcId: 21440, atkId: u.id, srcServantId: u.id, phase: 1 });
     }
 
     // 55. 巴吉里斯克（21460 剧毒暴君）：回合开始时使场上一名随机誓灵中毒
@@ -14021,7 +14062,7 @@ module.exports = {
   nearestOne, frontEnemies, firstFrontEnemy, backEnemies, firstBackEnemy, pickExtremeUnit,
   aiChoose, allyChoose, bestAttackChoice, choiceForSkill, estDamageOf, aiChooseDeep, autoChoose, normalizeWeatherState, validateBattleState,
   settleSkill, sortActors, applySkillPriorities, SKILL_PRIO_TABLE, skillChanceMul, NATURE_WEEK, feelCritBonus, feelHitBonus,
-  attrLvMul, hitDodgeLvMul, effectiveSpeed, initUnitBattleState,
+  attrLvMul, hitDodgeLvMul, effectiveSpeed, initUnitBattleState, resetUnitForNextWave,
   applySkillEffects, checkUnitCanAct, settleRoundEndTicks, settleRoundStartTalents, settleBattleStartTalents,
   RELIC_ROUND_HEAL, splitEffectByTarget, sanitizeEffectTargets, isZeroAttrChange, flattenEffects, gainStat,
   featureFxEffect, FX_23090, FX_23100, FX_23120,

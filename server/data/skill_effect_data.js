@@ -1507,6 +1507,9 @@ const SKILL_EFFECT_RULES = {
     "name": "七之弹",
     "effType": 1007,
     "type": 2,
+    "dmgMulVsUnacted": 1.25,
+    "selfHpCostPct": 20,
+    "selfHpCostFeatureId": 12231,
     "statChanges": [
       {
         "target": "target",
@@ -1521,14 +1524,9 @@ const SKILL_EFFECT_RULES = {
     "name": "冰之结界",
     "effType": 2099,
     "type": 3,
-    "statChanges": [
-      {
-        "target": "target",
-        "prop": 105,
-        "delta": -1,
-        "chance": 100
-      }
-    ]
+    // 「己方受到技能伤害时使攻击者速度下降1级；处于冰之结界时，四糸乃（21690 隐居者）不会受到克制伤害」
+    // 修复：旧版 statChanges 给己方全体降速属于反向 bug，改走 allyFields.iceBarrier
+    "iceBarrier": { "rounds": 3 }
   },
   // 米迦勒 10243 天国复仇：desc-AOE 族（调研-敌方AOE只打一人.md）。
   // 官方描述「无视攻击过己方的敌方誓灵的物防等级，若该次攻击击败了目标，则下次使用该技能
@@ -2120,7 +2118,7 @@ const SKILL_EFFECT_RULES = {
     "supportBanBoth": 2 },
   "10356": { "id": 10356, "name": "丰满的麦穗", "effType": 2011, "type": 3,
     // 扣除自身当前 25% 生命，使己方全体提升 3 项能力等级 1 级
-    "selfHpCostPct": 25, "randomStat": { "target": "ally", "count": 3, "delta": 1 } },
+    "selfHpCostPct": 25, "selfHpCostBasis": "current", "randomStat": { "target": "ally", "count": 3, "delta": 1 } },
   "10377": { "id": 10377, "name": "动物退散", "effType": 1007, "type": 3,
     // 吸引目标 3 回合内的单体攻击；非单体技能 → 随机防御 -1
     "tauntRounds": 3, "animalRepel": 3 },
@@ -2195,7 +2193,7 @@ const SKILL_EFFECT_RULES = {
   "10297": { "id": 10297, "name": "沐雨之祈", "effType": 2001, "type": 3,
     // 使用后若己方誓灵都携带气象石-雨 → 天气变为暴雨
     "weatherIfAllStone": 2 },
-  "10299": { "id": 10299, "name": "耀雨之光棘", "effType": 1007, "type": 2,
+  "10299": { "id": 10299, "name": "耀雨之光棘", "effType": 1058, "type": 1,
     // 使用后对自身造成 1/3 威力伤害；圣光天气下无副作用
     "selfDamageThird": true },
   "10307": { "id": 10307, "name": "诸天主宰", "effType": 1007, "type": 2,
@@ -2597,7 +2595,30 @@ const SKILL_EFFECT_RULES = {
     "lifeBloom": { "shieldPct": 10 } },
   "10402": { "id": 10402, "name": "回归初始", "effType": 1007, "type": 3,
     // 「清除目标能力等级，并将同等级同种类的能力等级随机分配给己方全体」
-    "stealAndDistributeStats": true }
+    "stealAndDistributeStats": true },
+  // —— 2026-11-22 七之弹同族自损/扣友方HP技能补齐 ——
+  "10217": { "id": 10217, "name": "星之陨", "effType": 1058, "type": 2,
+    // 「使用后使用者扣除18%最大生命值，夜幕下不受该效果影响」（最低保留 1 HP；WEATHER_IDS.NIGHT=6）
+    "selfHpCostPct": 18, "selfHpCostWeatherImmune": 6 },
+  "10295": { "id": 10295, "name": "迅捷复仇", "effType": 1007, "type": 2,
+    // 「随机扣除非自身的某一友方单位当前35%的生命」
+    "allyHpCostCurrentPct": 35 },
+  "10430": { "id": 10430, "name": "淬火", "effType": 1007, "type": 1,
+    // 「对自己造成最大生命的20%伤害，使本次技能伤害提高20%；该技能扣血效果导致生命为0时，同样触发天赋的后半段效果」
+    "quenchFire": { "selfMaxHpPct": 20, "dmgMul": 1.2 } },
+  // —— 2026-11-22 约会大作战联动其余专属技补齐 ——
+  "10237": { "id": 10237, "name": "灼炎再生", "effType": 2001, "type": 3,
+    // 「回复35%HP，使用者下次使用火属性技能伤害提升35%」（35% 回复已在 HEAL_SKILLS）
+    "nextFireDmgPct": 35 },
+  "10238": { "id": 10238, "name": "炽焰斩", "effType": 1056, "type": 1,
+    // 「造成伤害后，目标额外受到（使用者原始魔攻/使用者原始物攻）*18%最大HP的伤害」
+    "blazingSlashRatioPct": 18 },
+  "10242": { "id": 10242, "name": "永结冰霜", "effType": 1007, "type": 2,
+    // 「当对方场上誓灵速度的等级总和<0时，每负一级提升10%技能伤害」
+    "dmgMulPerEnemyNegSpd": 0.10 },
+  "10254": { "id": 10254, "name": "最后之剑", "effType": 1007, "type": 1,
+    // 「额外提升（目标已损失生命/目标最大生命）*100%的伤害」
+    "dmgMulByTargetMissingHp": 1.0 }
 }
 
 function getSkillRule(skillId) {
